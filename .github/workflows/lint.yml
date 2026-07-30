@@ -1,0 +1,48 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+  # Note: use an exact version to keep CI results reproducible.
+  GOLANGCI_LINT_VERSION: v2.11.4
+
+jobs:
+  golangci-lint:
+    if: (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository) ||
+      (github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The config is `default: all` with individually documented exceptions,
+      # and pins the allowed import set via depguard — an accidental new
+      # dependency fails here rather than after publication.
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+  codespell:
+    if: (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository) ||
+      (github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: codespell-project/actions-codespell@v2

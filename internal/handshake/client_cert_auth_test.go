@@ -1,0 +1,681 @@
+//nolint:testpackage // white-box: exercises unexported methods (recvServerFlight, selectClientSigAlg, etc.)
+package handshake
+
+// Tests for Phase 2: accepting optional CertificateRequest in the server
+// flight between Certificate and ServerHelloDone.
+//
+// These tests drive recvServerFlight directly (an unexported method extracted
+// from Handshake) so they stay isolated from cert verification, key derivation,
+// and the CKE/Finished exchange.
+//
+// Tests for Phase 3: emit client Certificate and CertificateVerify messages,
+// selectClientSigAlg, and sendClientCertificate wire bytes.
+
+import (
+	"bytes"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"fmt"
+	"math/big"
+	"testing"
+	"time"
+
+	"github.com/tarantool/go-gostls/internal/record"
+	"github.com/tarantool/go-gostls/internal/suites"
+	"github.com/tarantool/go-gostls/internal/testutil"
+)
+
+// -----------------------------------------------------------------------
+// low-level wire helpers
+// -----------------------------------------------------------------------.
+
+// buildHSRecord encodes a single TLS handshake record containing exactly one
+// handshake message (type + 3-byte length + body).
+func buildHSRecord(msgType Type, body []byte) []byte {
+	return testutil.AppendU16Prefixed([]byte{
+		record.ContentTypeHandshake,
+		0x03, 0x03, // TLS 1.2.
+	}, buildEnvelope(msgType, body))
+}
+
+// readWriteBuffer pairs a separate Reader and Writer for the record layer.
+// Reads come from r; writes (alerts sent by the state machine) go to w.
+type readWriteBuffer struct {
+	r *bytes.Buffer
+	w *bytes.Buffer
+}
+
+func (rw *readWriteBuffer) Read(p []byte) (int, error)  { return rw.r.Read(p) }
+func (rw *readWriteBuffer) Write(p []byte) (int, error) { return rw.w.Write(p) }
+
+// makeClientStateForFlight sets up a minimal ClientState with the given suite
+// and pre-loaded wire bytes.
+func makeClientStateForFlight(t *testing.T, wire []byte, suite *suites.Suite) *ClientState {
+	t.Helper()
+
+	rw := &readWriteBuffer{r: bytes.NewBuffer(wire), w: new(bytes.Buffer)}
+	layer := record.NewLayer(rw)
+	c := NewClientState(layer, ClientParams{InsecureSkipVerify: true})
+
+	c.suite = suite
+
+	return c
+}
+
+// mustLookupSuite looks up a suite by its OpenSSL name and fails the test if the
+// registry does not have it. Shared by every test in this package that needs a
+// real Suite to drive the state machine.
+func mustLookupSuite(t *testing.T, name string) *suites.Suite {
+	t.Helper()
+
+	suite, ok := suites.LookupByName(name)
+	testutil.Ok(t, ok, fmt.Sprintf("suites.LookupByName(%q)", name))
+
+	return suite
+}
+
+// -----------------------------------------------------------------------
+// cert / SKE builders
+// -----------------------------------------------------------------------.
+
+// newTestECDSACert creates a minimal self-signed ECDSA P-256 cert.
+func newTestECDSACert(t *testing.T) (*ecdsa.PrivateKey, *x509.Certificate) {
+	t.Helper()
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	testutil.NoErr(t, err, "generate ECDSA key")
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	testutil.NoErr(t, err, "create cert")
+
+	cert, err := x509.ParseCertificate(der)
+	testutil.NoErr(t, err, "parse cert")
+
+	return priv, cert
+}
+
+// newTestRSACert creates a minimal self-signed RSA-2048 cert. Returns private
+// key, parsed cert, and DER bytes.
+func newTestRSACert(t *testing.T) (*rsa.PrivateKey, *x509.Certificate, []byte) {
+	t.Helper()
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	testutil.NoErr(t, err, "generate RSA key")
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	testutil.NoErr(t, err, "create RSA cert")
+
+	cert, err := x509.ParseCertificate(der)
+	testutil.NoErr(t, err, "parse RSA cert")
+
+	return priv, cert, der
+}
+
+// newTestECDSACertWithDER creates a minimal self-signed ECDSA P-256 cert and
+// returns the private key, parsed cert, and DER bytes.
+func newTestECDSACertWithDER(t *testing.T) (*ecdsa.PrivateKey, *x509.Certificate, []byte) {
+	t.Helper()
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	testutil.NoErr(t, err, "generate ECDSA key")
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "ecdsa-client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	testutil.NoErr(t, err, "create ECDSA cert")
+
+	cert, err := x509.ParseCertificate(der)
+	testutil.NoErr(t, err, "parse ECDSA cert")
+
+	return priv, cert, der
+}
+
+// buildECDHESKEBody builds a valid ECDHE ServerKeyExchange body signed with priv.
+func buildECDHESKEBody(t *testing.T, priv *ecdsa.PrivateKey, clientRandom, serverRandom [32]byte) []byte {
+	t.Helper()
+
+	// Generate an ephemeral key using crypto/ecdh (avoids deprecated elliptic.Marshal).
+	// The public point is used in ServerECDHParams; priv (the func param) signs the body.
+	ephECDH, err := ecdh.P256().GenerateKey(rand.Reader)
+	testutil.NoErr(t, err, "gen ephemeral key")
+
+	point := ephECDH.PublicKey().Bytes() // uncompressed P-256 point.
+
+	// ServerECDHParams: curve_type(3=named) || named_curve(P-256=0x0017) || point_len || point.
+	params := make([]byte, 0, 4+len(point))
+
+	params = append(params, 0x03)
+	params = append(params, 0x00, 0x17)
+	params = append(params, byte(len(point)))
+	params = append(params, point...)
+
+	// Signed data: clientRandom || serverRandom || params.
+	signed := make([]byte, 64+len(params))
+	copy(signed[:32], clientRandom[:])
+	copy(signed[32:64], serverRandom[:])
+	copy(signed[64:], params)
+
+	digest := sha256.Sum256(signed)
+
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
+	testutil.NoErr(t, err, "sign SKE")
+
+	// body: params || hashAlg(sha256=0x04) || sigAlg(ecdsa=0x03) || uint16(sigLen) || sig
+	body := make([]byte, 0, len(params)+2+2+len(sig))
+
+	body = append(body, params...)
+	body = append(body, 0x04, 0x03)
+	body = append(body, byte(len(sig)>>8), byte(len(sig)))
+	body = append(body, sig...)
+
+	return body
+}
+
+// buildCertReqBody builds a minimal CertificateRequest wire body.
+func buildCertReqBody(certTypes []uint8) []byte {
+	sigAlgs := []SigAndHash{{Hash: 0x04, Sig: 0x01}} // sha256+rsa.
+
+	body := make([]byte, 0, 1+len(certTypes)+2+len(sigAlgs)*2+2)
+
+	body = append(body, byte(len(certTypes)))
+	body = append(body, certTypes...)
+
+	sigBytes := make([]byte, 2*len(sigAlgs))
+
+	for i, sa := range sigAlgs {
+		sigBytes[2*i] = sa.Hash
+		sigBytes[2*i+1] = sa.Sig
+	}
+
+	body = append(body, byte(len(sigBytes)>>8), byte(len(sigBytes)))
+	body = append(body, sigBytes...)
+	body = append(body, 0x00, 0x00) // empty CA list.
+
+	return body
+}
+
+// -----------------------------------------------------------------------
+// Test 1: happy path — SKE + CertReq + SHD (ECDHE suite)
+// -----------------------------------------------------------------------.
+
+func TestRecvServerFlight_SKE_CertReq_SHD(t *testing.T) {
+	t.Parallel()
+
+	priv, cert := newTestECDSACert(t)
+
+	var clientRandom, serverRandom [32]byte
+
+	for i := range clientRandom {
+		clientRandom[i] = byte(i)
+		serverRandom[i] = byte(i + 32)
+	}
+
+	skeBody := buildECDHESKEBody(t, priv, clientRandom, serverRandom)
+	certReqBody := buildCertReqBody([]uint8{0x01, 0x02}) // rsa_sign, dss_sign.
+
+	skeRec := buildHSRecord(TypeServerKeyExchange, skeBody)
+	certReqRec := buildHSRecord(TypeCertificateRequest, certReqBody)
+	shdRec := buildHSRecord(TypeServerHelloDone, nil)
+
+	wire := make([]byte, 0, len(skeRec)+len(certReqRec)+len(shdRec))
+
+	wire = append(wire, skeRec...)
+	wire = append(wire, certReqRec...)
+	wire = append(wire, shdRec...)
+
+	suite := mustLookupSuite(t, "ECDHE-RSA-AES128-SHA256")
+	c := makeClientStateForFlight(t, wire, suite)
+
+	c.clientRandom = clientRandom
+	c.serverRandom = serverRandom
+
+	serverKeyExchParams, err := c.recvServerFlight(cert)
+	testutil.NoErr(t, err, "recvServerFlight")
+
+	if serverKeyExchParams == nil {
+		t.Error("expected serverKeyExchParams to be non-nil")
+	}
+
+	if c.certReq == nil {
+		t.Fatal("expected certReq to be set, got nil")
+	}
+
+	if len(c.certReq.CertificateTypes) != 2 {
+		t.Errorf("CertificateTypes: got %v, want [0x01 0x02]", c.certReq.CertificateTypes)
+	}
+
+	if c.certReq.CertificateTypes[0] != 0x01 || c.certReq.CertificateTypes[1] != 0x02 {
+		t.Errorf("CertificateTypes values wrong: %v", c.certReq.CertificateTypes)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Test 2: happy path — CertReq only, no SKE (RSA suite)
+// -----------------------------------------------------------------------.
+
+func TestRecvServerFlight_CertReq_NoSKE(t *testing.T) {
+	t.Parallel()
+
+	certReqBody := buildCertReqBody([]uint8{0x01}) // rsa_sign.
+
+	certReqRec := buildHSRecord(TypeCertificateRequest, certReqBody)
+	shdRec := buildHSRecord(TypeServerHelloDone, nil)
+
+	wire := make([]byte, 0, len(certReqRec)+len(shdRec))
+
+	wire = append(wire, certReqRec...)
+	wire = append(wire, shdRec...)
+
+	suite := mustLookupSuite(t, "AES128-SHA256") // KexRSA.
+	c := makeClientStateForFlight(t, wire, suite)
+
+	serverKeyExchParams, err := c.recvServerFlight(nil)
+	testutil.NoErr(t, err, "recvServerFlight")
+
+	if serverKeyExchParams != nil {
+		t.Errorf("expected serverKeyExchParams nil for RSA (no SKE), got %x", serverKeyExchParams)
+	}
+
+	if c.certReq == nil {
+		t.Fatal("expected certReq to be set, got nil")
+	}
+
+	if len(c.certReq.CertificateTypes) != 1 || c.certReq.CertificateTypes[0] != 0x01 {
+		t.Errorf("CertificateTypes: got %v, want [0x01]", c.certReq.CertificateTypes)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Test 3: no CertReq — existing flow, SKE + SHD (ECDHE suite)
+// -----------------------------------------------------------------------.
+
+func TestRecvServerFlight_SKE_SHD_NoCertReq(t *testing.T) {
+	t.Parallel()
+
+	priv, cert := newTestECDSACert(t)
+
+	var clientRandom, serverRandom [32]byte
+
+	for i := range clientRandom {
+		clientRandom[i] = byte(i + 64)
+		serverRandom[i] = byte(i + 96)
+	}
+
+	skeBody := buildECDHESKEBody(t, priv, clientRandom, serverRandom)
+
+	skeRec := buildHSRecord(TypeServerKeyExchange, skeBody)
+	shdRec := buildHSRecord(TypeServerHelloDone, nil)
+
+	wire := make([]byte, 0, len(skeRec)+len(shdRec))
+
+	wire = append(wire, skeRec...)
+	wire = append(wire, shdRec...)
+
+	suite := mustLookupSuite(t, "ECDHE-RSA-AES128-SHA256")
+	c := makeClientStateForFlight(t, wire, suite)
+
+	c.clientRandom = clientRandom
+	c.serverRandom = serverRandom
+
+	serverKeyExchParams, err := c.recvServerFlight(cert)
+	testutil.NoErr(t, err, "recvServerFlight")
+
+	if serverKeyExchParams == nil {
+		t.Error("expected serverKeyExchParams set, got nil")
+	}
+
+	if c.certReq != nil {
+		t.Errorf("expected certReq nil (no CertReq in wire), got %+v", c.certReq)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Test 4: duplicate CertReq → fatal error
+// -----------------------------------------------------------------------.
+
+func TestRecvServerFlight_DuplicateCertReq(t *testing.T) {
+	t.Parallel()
+
+	certReqBody := buildCertReqBody([]uint8{0x01})
+
+	certReqRec := buildHSRecord(TypeCertificateRequest, certReqBody)
+	shdRec := buildHSRecord(TypeServerHelloDone, nil)
+
+	wire := make([]byte, 0, len(certReqRec)+len(certReqRec)+len(shdRec))
+
+	wire = append(wire, certReqRec...)
+	wire = append(wire, certReqRec...)
+	wire = append(wire, shdRec...)
+
+	suite := mustLookupSuite(t, "AES128-SHA256") // KexRSA.
+	c := makeClientStateForFlight(t, wire, suite)
+
+	_, err := c.recvServerFlight(nil)
+	testutil.WantErr(t, err, "c.recvServerFlight")
+}
+
+// -----------------------------------------------------------------------
+// Test 5: out-of-order — SKE after CertReq → fatal error
+// -----------------------------------------------------------------------.
+
+func TestRecvServerFlight_SKEAfterCertReq(t *testing.T) {
+	t.Parallel()
+
+	certReqBody := buildCertReqBody([]uint8{0x01})
+	// A minimal fake SKE body that would parse (the error fires before verification).
+	skeBody := []byte{0x03, 0x00, 0x17, 0x04} // too short to be valid, but error is out-of-order.
+
+	certReqRec := buildHSRecord(TypeCertificateRequest, certReqBody)
+	skeRec := buildHSRecord(TypeServerKeyExchange, skeBody)
+	shdRec := buildHSRecord(TypeServerHelloDone, nil)
+
+	wire := make([]byte, 0, len(certReqRec)+len(skeRec)+len(shdRec))
+
+	wire = append(wire, certReqRec...)
+	wire = append(wire, skeRec...)
+	wire = append(wire, shdRec...)
+
+	suite := mustLookupSuite(t, "AES128-SHA256") // KexRSA.
+	c := makeClientStateForFlight(t, wire, suite)
+
+	_, err := c.recvServerFlight(nil)
+	testutil.WantErr(t, err, "c.recvServerFlight")
+}
+
+// -----------------------------------------------------------------------
+// Phase 3 Tests: selectClientSigAlg
+// -----------------------------------------------------------------------.
+
+// newMinimalClientState builds a minimal ClientState with a certReq and optional
+// client certificates, suitable for testing selectClientSigAlg.
+func newMinimalClientState(certs []ClientCertificate, serverAlgs []SigAndHash) *ClientState {
+	return &ClientState{
+		params: ClientParams{
+			Certificates: certs,
+		},
+		certReq: &CertificateRequest{
+			SupportedSignatureAlgs: serverAlgs,
+		},
+	}
+}
+
+// TestSelectClientSigAlg_RSA_Server_SHA256_SHA384 tests that an RSA key with
+// server offering [sha256+rsa, sha384+rsa] picks sha256+rsa (first advertised).
+func TestSelectClientSigAlg_RSA_Server_SHA256_SHA384(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _, _ := newTestRSACert(t)
+
+	c := newMinimalClientState(
+		[]ClientCertificate{{PrivateKey: rsaKey}},
+		[]SigAndHash{
+			{Hash: 0x04, Sig: 0x01}, // sha256+rsa.
+			{Hash: 0x05, Sig: 0x01}, // sha384+rsa.
+		},
+	)
+
+	alg, ok := c.selectClientSigAlg()
+	testutil.Ok(t, ok, "selectClientSigAlg: RSA key vs server [sha256+rsa, sha384+rsa]")
+
+	// Must be the first entry in clientSigAlgsAdvertised that the server also supports.
+	// Our ClientHello advertise list: {sha256+rsa, sha384+rsa, sha256+ecdsa, sha384+ecdsa}
+	// Server has sha256+rsa and sha384+rsa; RSA key compatible with both.
+	// First advertised that server also has: sha256+rsa.
+	if alg.Hash != 0x04 || alg.Sig != 0x01 {
+		t.Errorf("got alg {Hash:0x%02x Sig:0x%02x}, want sha256+rsa {0x04 0x01}", alg.Hash, alg.Sig)
+	}
+}
+
+// TestSelectClientSigAlg_ECDSA_P256_ServerOnlyHasSHA384ECDSA tests that a P-256
+// ECDSA key returns false when server only offers sha384+ecdsa (P-256 is sha256).
+func TestSelectClientSigAlg_ECDSA_P256_ServerOnlyHasSHA384ECDSA(t *testing.T) {
+	t.Parallel()
+
+	ecKey, _, _ := newTestECDSACertWithDER(t) // P-256.
+
+	c := newMinimalClientState(
+		[]ClientCertificate{{PrivateKey: ecKey}},
+		[]SigAndHash{
+			{Hash: 0x05, Sig: 0x03}, // sha384+ecdsa only.
+		},
+	)
+
+	_, ok := c.selectClientSigAlg()
+	testutil.NotOk(t, ok, "selectClientSigAlg: P-256 key vs sha384+ecdsa")
+}
+
+// TestSelectClientSigAlg_RSA_ServerOnlyHasSHA512 tests that when server only
+// offers sha512+rsa (not in our ClientHello advertise list), returns false.
+func TestSelectClientSigAlg_RSA_ServerOnlyHasSHA512(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _, _ := newTestRSACert(t)
+
+	c := newMinimalClientState(
+		[]ClientCertificate{{PrivateKey: rsaKey}},
+		[]SigAndHash{
+			{Hash: 0x06, Sig: 0x01}, // sha512+rsa — not in our advertised list.
+		},
+	)
+
+	_, ok := c.selectClientSigAlg()
+	testutil.NotOk(t, ok, "selectClientSigAlg: sha512+rsa not in advertised list")
+}
+
+// TestSelectClientSigAlg_NilCertReq tests that nil certReq returns false.
+func TestSelectClientSigAlg_NilCertReq(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _, _ := newTestRSACert(t)
+
+	c := &ClientState{
+		params: ClientParams{
+			Certificates: []ClientCertificate{{PrivateKey: rsaKey}},
+		},
+		certReq: nil,
+	}
+
+	_, ok := c.selectClientSigAlg()
+	testutil.NotOk(t, ok, "selectClientSigAlg: nil certReq")
+}
+
+// TestSelectClientSigAlg_EmptyCertificates tests that no client certs returns false.
+func TestSelectClientSigAlg_EmptyCertificates(t *testing.T) {
+	t.Parallel()
+
+	c := newMinimalClientState(
+		nil,
+		[]SigAndHash{{Hash: 0x04, Sig: 0x01}},
+	)
+
+	_, ok := c.selectClientSigAlg()
+	testutil.NotOk(t, ok, "selectClientSigAlg: empty certificate list")
+}
+
+// -----------------------------------------------------------------------
+// Phase 3 Tests: sendClientCertificate wire bytes
+// -----------------------------------------------------------------------.
+
+// makeRecordLayerWithCapture returns a record layer whose writes go to a buffer.
+func makeRecordLayerWithCapture() (*record.Layer, *bytes.Buffer) {
+	w := new(bytes.Buffer)
+	rw := &readWriteBuffer{r: new(bytes.Buffer), w: w}
+
+	return record.NewLayer(rw), w
+}
+
+// TestSendClientCertificate_Empty verifies that empty Certificates → empty cert
+// message: handshake type 0x0b, 3-byte zero body (7 bytes total payload).
+func TestSendClientCertificate_Empty(t *testing.T) {
+	t.Parallel()
+
+	layer, w := makeRecordLayerWithCapture()
+
+	c := &ClientState{
+		params:     ClientParams{Certificates: nil},
+		layer:      layer,
+		transcript: NewTranscript(),
+	}
+
+	sent, err := c.sendClientCertificate()
+	testutil.NoErr(t, err, "sendClientCertificate")
+
+	testutil.NotOk(t, sent, "sendClientCertificate: empty cert list")
+
+	// The expected handshake fragment: 0b 00 00 03 00 00 00 (7 bytes).
+	want, wantMErr := MarshalMessage(&Certificate{})
+	testutil.NoErr(t, wantMErr, "MarshalMessage(empty Certificate)")
+	testutil.Len(t, want, 7, "empty Certificate message")
+
+	// Parse the TLS record written to w.
+	written := w.Bytes()
+	testutil.MinLen(t, written, 5, "sendClientCertificate: record header")
+
+	if written[0] != record.ContentTypeHandshake {
+		t.Errorf("content type 0x%02x, want 0x%02x (handshake)", written[0], record.ContentTypeHandshake)
+	}
+
+	payloadLen := int(written[3])<<8 | int(written[4])
+	testutil.MinLen(t, written, 5+payloadLen, "sendClientCertificate: record body")
+
+	payload := written[5 : 5+payloadLen]
+	testutil.EqualBytes(t, payload, want, "payload")
+}
+
+// TestSendClientCertificate_OneRSACert verifies that a single RSA cert produces
+// a Certificate message containing the DER bytes.
+func TestSendClientCertificate_OneRSACert(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _, der := newTestRSACert(t)
+
+	layer, w := makeRecordLayerWithCapture()
+
+	c := &ClientState{
+		params: ClientParams{
+			Certificates: []ClientCertificate{
+				{RawCertificate: der, PrivateKey: rsaKey},
+			},
+		},
+		layer:      layer,
+		transcript: NewTranscript(),
+		certReq: &CertificateRequest{
+			SupportedSignatureAlgs: []SigAndHash{
+				{Hash: 0x04, Sig: 0x01}, // sha256+rsa.
+			},
+		},
+	}
+
+	sent, err := c.sendClientCertificate()
+	testutil.NoErr(t, err, "sendClientCertificate")
+
+	testutil.Ok(t, sent, "sendClientCertificate: one RSA cert")
+
+	// Parse the TLS record.
+	written := w.Bytes()
+	testutil.MinLen(t, written, 5, "sendClientCertificate: record header")
+
+	payloadLen := int(written[3])<<8 | int(written[4])
+	testutil.MinLen(t, written, 5+payloadLen, "sendClientCertificate: record body")
+
+	payload := written[5 : 5+payloadLen]
+
+	// msg type = 0x0b (Certificate).
+	if payload[0] != 0x0b {
+		t.Errorf("msg type = 0x%02x, want 0x0b", payload[0])
+	}
+
+	// The DER cert bytes must appear in the payload.
+	if !bytes.Contains(payload, der) {
+		t.Errorf("payload does not contain the DER cert bytes\npayload=%x\nder=%x", payload, der)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Phase 3 Tests: sendCertificateVerify
+// -----------------------------------------------------------------------.
+
+// TestSendCertificateVerify_RSA verifies that sendCertificateVerify with an RSA
+// key produces a CertificateVerify message whose signature verifies against the
+// transcript.
+func TestSendCertificateVerify_RSA(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _, _ := newTestRSACert(t)
+
+	layer, w := makeRecordLayerWithCapture()
+
+	tr := NewTranscript()
+	// Write some fake transcript data to simulate prior messages.
+	tr.Write([]byte("fake transcript data for testing"))
+
+	c := &ClientState{
+		params:     ClientParams{Rand: rand.Reader, Certificates: []ClientCertificate{{PrivateKey: rsaKey}}},
+		layer:      layer,
+		transcript: tr,
+	}
+
+	alg := SigAndHash{Hash: 0x04, Sig: 0x01} // sha256+rsa.
+
+	err := c.sendCertificateVerify(alg)
+	testutil.NoErr(t, err, "sendCertificateVerify")
+
+	// Parse the written record.
+	written := w.Bytes()
+	testutil.MinLen(t, written, 5, "sendCertificateVerify: record header")
+
+	payloadLen := int(written[3])<<8 | int(written[4])
+	payload := written[5 : 5+payloadLen]
+
+	// Parse the CertificateVerify message.
+	cv, _, err := ParseMessage(payload)
+	testutil.NoErr(t, err, "parse CertificateVerify")
+
+	cvMsg, ok := cv.(*CertificateVerify)
+	testutil.Ok(t, ok, fmt.Sprintf("ParseMessage: got %T, want *CertificateVerify", cv))
+
+	if cvMsg.Algorithm.Hash != 0x04 || cvMsg.Algorithm.Sig != 0x01 {
+		t.Errorf("algorithm mismatch: got {0x%02x,0x%02x}", cvMsg.Algorithm.Hash, cvMsg.Algorithm.Sig)
+	}
+
+	// Verify the signature using hashForSigAlg (the shared helper).
+	// The transcript at signing time contained only "fake transcript data for testing".
+	cryptoHash, hashErr := hashForSigAlg(alg.Hash)
+	testutil.NoErr(t, hashErr, "hashForSigAlg")
+
+	h := cryptoHash.New()
+	h.Write([]byte("fake transcript data for testing"))
+
+	expectedDigest := h.Sum(nil)
+
+	verifyErr := rsa.VerifyPKCS1v15(&rsaKey.PublicKey, cryptoHash, expectedDigest, cvMsg.Signature)
+	testutil.NoErr(t, verifyErr, "signature verification failed")
+}

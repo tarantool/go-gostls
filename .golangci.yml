@@ -1,0 +1,238 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+formatters:
+  enable:
+    - goimports
+
+issues:
+  # Disable limits on the number of printed issues
+  max-issues-per-linter: 0 # 0 = no limit
+  max-same-issues: 0 # 0 = no limit
+
+linters:
+  default: all
+
+  disable:
+    - dupl # Dupl is disabled, since we're generating a lot of boilerplate code.
+    - cyclop # Cyclop is disabled, since cyclomatic complexities is very abstract metric,
+      # that sometimes lead to strange linter behaviour.
+    - wsl # WSL is disabled, since it's obsolete. Using WSL_v5.
+    - nlreturn # nlreturn is disabled, since it's duplicated by wsl_v5.return check.
+    - ireturn # ireturn is disabled, since it's not needed.
+    - godox # godox is disabled to allow TODO comments for unimplemented functionality.
+    - gocognit # gocognit is disabled, cognitive complexity is too restrictive.
+    - gocyclo # gocyclo is disabled, cyclomatic complexities is very abstract metric,
+      # that sometimes lead to strange linter behaviour.
+    - funlen # funlen is disabled, function length limits are too restrictive.
+    - maintidx # maintidx is disabled, purpose of this metric is unknown.
+
+    # nonamedreturns is disabled because the names here are load-bearing.
+    # The key-exchange signatures return two same-typed values —
+    # (cke []byte, preMaster []byte, err error) — and the names are the only
+    # thing telling them apart. Confusing the ClientKeyExchange body with the
+    # pre-master secret would put the pre-master on the wire. The same applies
+    # to (p, g, ys []byte), (privBytes, pubBytes []byte) and
+    # (level, description uint8). No function here uses a naked return, which
+    # is the pattern that makes named returns risky, so they are documentation
+    # with no downside.
+    - nonamedreturns
+
+    # gochecknoinits is disabled: the two init functions build the cipher-suite
+    # registry, the same pattern crypto/tls uses. register() is unexported and
+    # the maps are never written afterwards, so there is nothing to race and no
+    # honest restructuring that removes them — see the gochecknoglobals
+    # exceptions below.
+    - gochecknoinits
+
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test.go
+        linters:
+          - wrapcheck
+          # exhaustruct is narrowed to suites.Suite (see settings), where an
+          # incomplete literal means a mis-registered cipher suite. Tests build
+          # synthetic Suites that are partial on purpose — zero key lengths are
+          # how they reach ErrZeroKeyBlock — so completeness there would
+          # contradict the fixture rather than check anything.
+          - exhaustruct
+          # Table-driven tests conventionally use short names for the case
+          # variable and the fixtures built from it (tc, ex, tr, ln, ...).
+          # Enforced in production code, where the names have to carry.
+          - varnamelen
+          # err113 wants sentinel errors so callers can use errors.Is. Test
+          # helpers build one-off errors to inject a fault or report a fixture
+          # problem, and nothing calls errors.Is on them. Scoped to tests
+          # rather than disabled: production code has no such errors today and
+          # a new one should still be reported.
+          - err113
+
+      # gochecknoglobals, per file, with the reason each global exists. Not
+      # disabled outright: a new package-level variable anywhere else still
+      # fails the lint.
+      #
+      # The suite registry is the crypto/tls pattern — two init functions call
+      # the unexported register() to fill the ID and name maps, and nothing can
+      # write them afterwards. The spec* values are the shared CipherSpec /
+      # MACSpec / PRFSpec those registrations point at; they are structs, so
+      # const is not available.
+      - path: internal/suites/(suite|registry|gost_suites)\.go
+        linters:
+          - gochecknoglobals
+
+      # Read-only tables that const cannot express: asn1.ObjectIdentifier is a
+      # slice, the meshing key is an array (RFC 4357 section 2.3.2), and the
+      # advertised signature algorithms and cipher-name set are a slice and a map.
+      - path: internal/(ke/vkogost|record/protection_gost|handshake/client)\.go
+        linters:
+          - gochecknoglobals
+
+      # The wire-debug log is deliberately one per process: a mutex, the file
+      # handle it guards, and a once-only open-failure flag.
+      - path: internal/record/wire_debug\.go
+        linters:
+          - gochecknoglobals
+
+      # Test fixtures: certificates cached behind a sync.Once, DH group
+      # parameters, and DER blobs shared across cases in a file.
+      - path: _test\.go
+        linters:
+          - gochecknoglobals
+
+      # G115 (integer truncation) only, and only in tests: fixture builders
+      # hand-assemble wire bytes, including deliberately malformed ones for the
+      # negative tests. Scoped by rule text rather than disabling gosec here, so
+      # its other rules still apply to test code, and scoped to tests so every
+      # production conversion stays flagged unless individually justified.
+      - path: _test.go
+        text: "G115"
+        linters:
+          - gosec
+
+  settings:
+    exhaustruct:
+      # exhaustruct defaults to every struct, which fights Go's zero value.
+      # Nearly every literal here is deliberately partial: Conn leaves its
+      # mutexes and buffers zero, Config is filled in by the caller, specNoMAC
+      # is an empty MACSpec on purpose, and CipherSpec.TagLen is meaningless
+      # for non-AEAD ciphers. Requiring those to be spelled out would add noise
+      # and say nothing.
+      #
+      # Setting include narrows it to the one struct where a missing field is a
+      # real defect rather than a default. A suites.Suite with no PRF, or the
+      # wrong Auth, is a mis-registered cipher suite: it would be built and put
+      # in the registry, and only misbehave at handshake time. All 32
+      # registrations name all seven fields today; this keeps it that way.
+      include:
+        - 'github\.com/tarantool/go-gostls/internal/suites\.Suite'
+
+    wrapcheck:
+      # wrapcheck calls every other package "external", including this module's
+      # own. Errors crossing genuine boundaries — crypto/*, io, net, asn1,
+      # golang.org/x/crypto, go-gostcrypto — are wrapped at the call site. These
+      # two lists cover the cases where wrapping would add nothing or do harm.
+      #
+      # Our own internal packages already name themselves in every error
+      # ("tls record: ", "handshake: ", "ke/vkogost: ", "suites: "), so wrapping
+      # again only doubles the prefix.
+      ignore-package-globs:
+        - github.com/tarantool/go-gostls/internal/*
+
+      # Conn wraps a net.Conn, and these four are transparent passthroughs:
+      # crypto/tls returns them bare too, and a caller type-asserting to
+      # net.Error or comparing against os.ErrDeadlineExceeded expects the
+      # original error, not a re-labelled one. Listed individually so any other
+      # net call is still checked.
+      #
+      # The first block restates wrapcheck's own defaults, which are replaced
+      # rather than merged once this key is set.
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Unwrap(
+        - errors.Join(
+        - .Wrap(
+        - .Wrapf(
+        - .WithMessage(
+        - .WithMessagef(
+        - .WithStack(
+        - (net.Conn).Close(
+        - (net.Conn).SetDeadline(
+        - (net.Conn).SetReadDeadline(
+        - (net.Conn).SetWriteDeadline(
+
+      # Protector and Message are this module's own interfaces, covered by the
+      # package rationale above.
+      ignore-interface-regexps:
+        - ^github\.com/tarantool/go-gostls/internal/.*$
+
+    varnamelen:
+      # Each name below is a symbol from the TLS or GOST specifications, or a
+      # universal Go idiom. Spelling them out would obscure the correspondence
+      # between the code and the standard it implements, which is the main
+      # thing a reader checks in a protocol implementation. Names that carry
+      # no such meaning are spelled out instead (see gostCert, serverHello,
+      # compMethods).
+      ignore-names:
+        - tt # table-driven test case.
+        - ok # comma-ok idiom.
+        - tb # testing.TB.
+        - b # wire buffer being parsed (handshake/record parsers).
+        - c # receiver-like *ClientState / *Conn binding.
+        - v # generic value in small helpers.
+        - i # loop index.
+        - n # byte count / length, per io conventions.
+        - m # message being marshaled.
+        - s # suite / string in small helpers.
+        - d # duration or decoded buffer in small helpers.
+        - h # hash.Hash.
+        - k # key.
+        - p # DHE prime modulus (RFC 5246 §7.4.3 dh_p).
+        - g # DHE generator (RFC 5246 §7.4.3 dh_g).
+        - g2 # second 32-bit half in the GOST key-meshing step.
+        - ys # DHE server public value (RFC 5246 §7.4.3 dh_Ys).
+        - yc # DHE client public value (RFC 5246 §7.4.3 dh_Yc).
+        - Z # VKO shared secret (RFC 4357 / RFC 7836).
+        - iv # initialization vector.
+        - ct # ciphertext.
+        - pt # plaintext.
+        - ad # additional authenticated data (AEAD).
+        - km # key material block from the PRF key schedule.
+        - mk # MAC key.
+        - ek # encryption key.
+        - id # IANA cipher suite identifier.
+    godot:
+      scope: all
+    lll:
+      line-length: 120
+      tab-width: 4
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+      case-max-lines: 0
+      default: all
+    depguard:
+      rules:
+        main:
+          files:
+            - "$all"
+            - "!$test"
+          allow:
+            - $gostd
+            - "github.com/tarantool/go-gostls"
+            - "github.com/tarantool/go-gostcrypto"
+            - "filippo.io/bigmod"
+            - "golang.org/x/crypto"
+        test:
+          files:
+            - "$test"
+          allow:
+            - $gostd
+            - "github.com/tarantool/go-gostls"
+            - "github.com/tarantool/go-gostcrypto"
+            - "filippo.io/bigmod"
+            - "golang.org/x/crypto"

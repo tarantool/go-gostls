@@ -1,0 +1,1213 @@
+package gostls_test
+
+import (
+	"context"
+	"crypto"
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"hash"
+	"math/big"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/tarantool/go-gostls"
+	"github.com/tarantool/go-gostls/internal/ke"
+	"github.com/tarantool/go-gostls/internal/record"
+	"github.com/tarantool/go-gostls/internal/suites"
+	"github.com/tarantool/go-gostls/internal/testutil"
+)
+
+// ============================================================================
+// Test fixture generation — cached per test binary.
+// ============================================================================.
+
+var (
+	testCACert    *x509.Certificate
+	testCAKey     *rsa.PrivateKey
+	testCACertPEM []byte
+
+	testServerCert    *x509.Certificate
+	testServerKey     *rsa.PrivateKey
+	testServerCertDER []byte
+
+	testFixtureOnce sync.Once
+)
+
+func initTestFixtures(t *testing.T) {
+	t.Helper()
+	testFixtureOnce.Do(func() {
+		// Generate RSA-2048 root CA.
+		caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		testutil.NoErr(t, err, "generate CA key")
+
+		testCAKey = caKey
+
+		caTemplate := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: "Test CA"},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(24 * time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		}
+
+		caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+		testutil.NoErr(t, err, "create CA cert")
+
+		testCACert, err = x509.ParseCertificate(caDER)
+		testutil.NoErr(t, err, "parse CA cert")
+
+		testCACertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+		// Generate RSA-2048 server certificate signed by the CA.
+		serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		testutil.NoErr(t, err, "generate server key")
+
+		testServerKey = serverKey
+
+		serverTemplate := &x509.Certificate{
+			SerialNumber: big.NewInt(2),
+			Subject:      pkix.Name{CommonName: "test.example.com"},
+			DNSNames:     []string{"test.example.com"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}
+
+		serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, testCACert, &serverKey.PublicKey, caKey)
+		testutil.NoErr(t, err, "create server cert")
+
+		testServerCertDER = serverDER
+
+		testServerCert, err = x509.ParseCertificate(serverDER)
+		testutil.NoErr(t, err, "parse server cert")
+	})
+}
+
+// rootCAsForTest builds a cert pool containing the test CA.
+func rootCAsForTest(t *testing.T) *x509.CertPool {
+	t.Helper()
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(testCACertPEM) {
+		t.Fatal("failed to add test CA to cert pool")
+	}
+
+	return pool
+}
+
+// ============================================================================
+// hashAccumulator tracks handshake transcript bytes with a given hash function.
+// ============================================================================.
+
+type hashAccumulator struct {
+	h hash.Hash
+}
+
+func newHashAccumulator(newHash func() hash.Hash) *hashAccumulator {
+	return &hashAccumulator{h: newHash()}
+}
+
+func (a *hashAccumulator) Write(msg []byte) {
+	a.h.Write(msg)
+}
+
+func (a *hashAccumulator) Sum() []byte {
+	return a.h.Sum(nil)
+}
+
+// ============================================================================
+// scripted server helper
+// ============================================================================.
+
+type scriptedServer struct {
+	layer *record.Layer
+	t     *testing.T
+}
+
+func newScriptedServer(t *testing.T, conn net.Conn) *scriptedServer {
+	t.Helper()
+
+	return &scriptedServer{
+		layer: record.NewLayer(conn),
+		t:     t,
+	}
+}
+
+// readClientHello reads a ClientHello record and returns the full 4-byte-enveloped payload.
+func (s *scriptedServer) readClientHello() []byte {
+	s.t.Helper()
+
+	ct, payload, err := s.layer.ReadRecord()
+	testutil.NoErr(s.t, err, "scripted server: read ClientHello")
+	testutil.Equal(s.t, ct, record.ContentTypeHandshake, "scripted server: ClientHello content type")
+
+	testutil.MinLen(s.t, payload, 4, "scripted server: ClientHello payload")
+
+	if payload[0] != 1 {
+		s.t.Fatalf("scripted server: expected ClientHello (1), got %d", payload[0])
+	}
+
+	return payload
+}
+
+// writeHandshake sends the pre-built 4-byte-enveloped handshake message.
+func (s *scriptedServer) writeHandshake(msg []byte) {
+	s.t.Helper()
+
+	err := s.layer.WriteRecord(record.ContentTypeHandshake, msg)
+	testutil.NoErr(s.t, err, "scripted server: write handshake record")
+}
+
+// writeCCS sends a ChangeCipherSpec record.
+func (s *scriptedServer) writeCCS() {
+	s.t.Helper()
+
+	err := s.layer.WriteRecord(record.ContentTypeChangeCipherSpec, []byte{1})
+	testutil.NoErr(s.t, err, "scripted server: write CCS")
+}
+
+// readHandshakeMessage reads the next handshake record.
+// Returns msgType and body (without 4-byte envelope), and the full envelope.
+func (s *scriptedServer) readHandshakeMessage() (msgType uint8, body []byte, envelope []byte) {
+	s.t.Helper()
+
+	ct, payload, err := s.layer.ReadRecord()
+	testutil.NoErr(s.t, err, "scripted server: read record")
+	testutil.Equal(s.t, ct, record.ContentTypeHandshake, "scripted server: handshake content type")
+
+	testutil.MinLen(s.t, payload, 4, "scripted server: handshake record")
+
+	msgType = payload[0]
+
+	bodyLen := uint32(payload[1])<<16 | uint32(payload[2])<<8 | uint32(payload[3])
+
+	testutil.MinLen(s.t, payload, int(4+bodyLen), "scripted server: handshake body")
+
+	return msgType, payload[4 : 4+bodyLen], payload[:4+bodyLen]
+}
+
+// readCCS reads and validates a ChangeCipherSpec from the client.
+func (s *scriptedServer) readCCS() {
+	s.t.Helper()
+
+	ct, payload, err := s.layer.ReadRecord()
+	testutil.NoErr(s.t, err, "scripted server: read CCS")
+	testutil.Equal(s.t, ct, record.ContentTypeChangeCipherSpec, "scripted server: CCS content type")
+
+	if len(payload) != 1 || payload[0] != 1 {
+		s.t.Fatalf("scripted server: malformed CCS")
+	}
+}
+
+// ============================================================================
+// Handshake message builders.
+// ============================================================================.
+
+func buildServerHello(random [32]byte, suiteID uint16) []byte {
+	var body []byte
+
+	body = testutil.AppendU16(body, 0x0303)
+	body = append(body, random[:]...)
+	body = append(body, 0x00)                // session_id length = 0.
+	body = testutil.AppendU16(body, suiteID) // cipher_suite.
+	body = append(body, 0x00)                // compression_method = null.
+	// renegotiation_info extension (RFC 5746): type=0xFF01, len=1, body={0x00}.
+	ext := marshalExt(0xFF01, []byte{0x00})
+
+	body = testutil.AppendU16Prefixed(body, ext)
+
+	return wrapHS(2, body)
+}
+
+func buildCertificate(derCerts [][]byte) []byte {
+	var list []byte
+	for _, c := range derCerts {
+		list = testutil.AppendU24Prefixed(list, c)
+	}
+
+	return wrapHS(11, testutil.AppendU24Prefixed(nil, list))
+}
+
+func buildServerHelloDone() []byte {
+	return wrapHS(14, nil)
+}
+
+// wrapHS wraps body in the 4-byte handshake envelope: msg_type || uint24 length.
+func wrapHS(msgType uint8, body []byte) []byte {
+	return testutil.AppendU24Prefixed([]byte{msgType}, body)
+}
+
+// marshalExt frames body as a TLS extension: extension_type || uint16 length.
+func marshalExt(extType uint16, body []byte) []byte {
+	return testutil.AppendU16Prefixed(testutil.AppendU16(nil, extType), body)
+}
+
+// buildECDHEServerKeyExchange builds a ServerKeyExchange for ECDHE-RSA with P-256.
+func buildECDHEServerKeyExchange(
+	serverECPub []byte,
+	clientRandom, serverRandom [32]byte,
+	signerKey *rsa.PrivateKey,
+) []byte {
+	// ServerECDHParams: curve_type=3, named_curve=0x0017 (P-256), public.
+	params := make([]byte, 0, 4+len(serverECPub))
+
+	params = append(params, 0x03, 0x00, 0x17)
+	params = testutil.AppendU8Prefixed(params, serverECPub)
+
+	// Signature covers: clientRandom || serverRandom || ServerECDHParams.
+	signed := make([]byte, 0, 32+32+len(params))
+
+	signed = append(signed, clientRandom[:]...)
+	signed = append(signed, serverRandom[:]...)
+	signed = append(signed, params...)
+
+	h := sha256.Sum256(signed)
+
+	sig, err := rsa.SignPKCS1v15(rand.Reader, signerKey, crypto.SHA256, h[:])
+	if err != nil {
+		panic(fmt.Sprintf("buildECDHEServerKeyExchange: sign: %v", err))
+	}
+
+	body := append([]byte{}, params...)
+
+	body = append(body, 0x04, 0x01) // sha256, rsa.
+	body = testutil.AppendU16Prefixed(body, sig)
+
+	return wrapHS(12, body)
+}
+
+// buildDHEServerKeyExchange builds a ServerKeyExchange for DHE-RSA with ffdhe2048.
+func buildDHEServerKeyExchange(
+	pBytes, gBytes, ysBytes []byte,
+	clientRandom, serverRandom [32]byte,
+	signerKey *rsa.PrivateKey,
+) []byte {
+	var dhParams []byte
+
+	dhParams = testutil.AppendU16Prefixed(dhParams, pBytes)
+	dhParams = testutil.AppendU16Prefixed(dhParams, gBytes)
+	dhParams = testutil.AppendU16Prefixed(dhParams, ysBytes)
+
+	signed := make([]byte, 0, 32+32+len(dhParams))
+
+	signed = append(signed, clientRandom[:]...)
+	signed = append(signed, serverRandom[:]...)
+	signed = append(signed, dhParams...)
+
+	h := sha256.Sum256(signed)
+
+	sig, err := rsa.SignPKCS1v15(rand.Reader, signerKey, crypto.SHA256, h[:])
+	if err != nil {
+		panic(fmt.Sprintf("buildDHEServerKeyExchange: sign: %v", err))
+	}
+
+	body := append([]byte{}, dhParams...)
+
+	body = append(body, 0x04, 0x01)
+	body = testutil.AppendU16Prefixed(body, sig)
+
+	return wrapHS(12, body)
+}
+
+func buildServerFinished(suite *suites.Suite, masterSecret, transcriptHash []byte) []byte {
+	verifyData, err := suites.FinishedVerifyData(suite, masterSecret, "server finished", transcriptHash)
+	if err != nil {
+		panic(fmt.Sprintf("buildServerFinished: %v", err))
+	}
+
+	body := make([]byte, 12)
+	copy(body, verifyData)
+
+	return wrapHS(20, body)
+}
+
+// ============================================================================
+// ffdhe2048 constants for DHE tests.
+// ============================================================================.
+
+// ffdhe2048P is a package-level fixture, so it uses testutil.Must rather than
+// testutil.MustHex: there is no *testing.T at initialization time.
+var ffdhe2048P = testutil.Must(hex.DecodeString(
+	"FFFFFFFFFFFFFFFF" +
+		"ADF85458A2BB4A9A" +
+		"AFDC5620273D3CF1" +
+		"D8B9C583CE2D3695" +
+		"A9E13641146433FB" +
+		"CC939DCE249B3EF9" +
+		"7D2FE363630C75D8" +
+		"F681B202AEC4617A" +
+		"D3DF1ED5D5FD6561" +
+		"2433F51F5F066ED0" +
+		"856365553DED1AF3" +
+		"B557135E7F57C935" +
+		"984F0C70E0E68B77" +
+		"E2A689DAF3EFE872" +
+		"1DF158A136ADE735" +
+		"30ACCA4F483A797A" +
+		"BC0AB182B324FB61" +
+		"D108A94BB2C8E3FB" +
+		"B96ADAB760D7F468" +
+		"1D4F42A3DE394DF4" +
+		"AE56EDE76372BB19" +
+		"0B07A7C8EE0A6D70" +
+		"9E02FCE1CDF7E2EC" +
+		"C03405CD28342F61" +
+		"9172FE9CE98583FF" +
+		"8E4F1232EEF28183" +
+		"C3FE3B1B4C6FAD73" +
+		"3BB5FCBC2EC22005" +
+		"C58EF1837D1683B2" +
+		"C6F34A26C1B2EFFA" +
+		"886B423861285C97" +
+		"FFFFFFFFFFFFFFFF",
+))
+
+var ffdhe2048G = []byte{0x02}
+
+// ============================================================================
+// Key material helpers for the server side.
+// ============================================================================.
+
+func expandKeysForTest(
+	suite *suites.Suite, masterSecret, clientRandom, serverRandom []byte, ivLen int,
+) (*suites.KeyMaterial, error) {
+	seed := make([]byte, 64)
+	copy(seed[:32], serverRandom)
+	copy(seed[32:], clientRandom)
+
+	macKeyLen := suite.MAC.KeyLen
+	encKeyLen := suite.Cipher.KeyLen
+	totalLen := 2*macKeyLen + 2*encKeyLen + 2*ivLen
+
+	if totalLen == 0 {
+		return nil, errors.New("key block length is zero")
+	}
+
+	keyBlock, err := suites.PRF(suite.PRF.Hash, masterSecret, []byte("key expansion"), seed, totalLen)
+	if err != nil {
+		return nil, err
+	}
+
+	km := &suites.KeyMaterial{}
+	off := 0
+
+	if macKeyLen > 0 {
+		km.ClientMACKey = keyBlock[off : off+macKeyLen]
+
+		off += macKeyLen
+
+		km.ServerMACKey = keyBlock[off : off+macKeyLen]
+
+		off += macKeyLen
+	}
+
+	km.ClientEncKey = keyBlock[off : off+encKeyLen]
+
+	off += encKeyLen
+
+	km.ServerEncKey = keyBlock[off : off+encKeyLen]
+
+	off += encKeyLen
+
+	if ivLen > 0 {
+		km.ClientIV = keyBlock[off : off+ivLen]
+
+		off += ivLen
+
+		km.ServerIV = keyBlock[off : off+ivLen]
+	}
+
+	return km, nil
+}
+
+func buildProtectorForTest(suite *suites.Suite, encKey, macKey, iv []byte) (record.Protector, error) {
+	if suite.Cipher.AEAD {
+		return record.NewAEADProtector(encKey, iv)
+	}
+
+	var newHash record.NewHashFunc
+
+	switch suite.MAC.MACLen {
+	case 20:
+		newHash = record.SHA1Hash
+	case 32:
+		newHash = record.SHA256Hash
+	case 48:
+		newHash = record.SHA384Hash
+	default:
+		return nil, fmt.Errorf("unsupported MAC len %d", suite.MAC.MACLen)
+	}
+
+	return record.NewCBCHMACProtector(record.NewAESCipher, newHash, encKey, macKey)
+}
+
+// ============================================================================
+// serverHandshakeRunner drives the scripted server through the full handshake.
+// ============================================================================.
+
+// serverRunner holds all the state needed to script the server side.
+type serverRunner struct {
+	t            *testing.T
+	srv          *scriptedServer
+	suite        *suites.Suite
+	tr           *hashAccumulator
+	masterSecret []byte
+	km           *suites.KeyMaterial
+}
+
+func newServerRunner(t *testing.T, srv *scriptedServer, suite *suites.Suite) *serverRunner {
+	t.Helper()
+
+	return &serverRunner{
+		t:     t,
+		srv:   srv,
+		suite: suite,
+		tr:    newHashAccumulator(suite.PRF.Hash),
+	}
+}
+
+// runHandshakeUntilAppData runs the full server-side handshake.
+// Returns clientRandom extracted from the ClientHello.
+func (r *serverRunner) runFullHandshake(serverRandom [32]byte) {
+	r.t.Helper()
+
+	suite := r.suite
+
+	// Read ClientHello.
+	chEnv := r.srv.readClientHello()
+	r.tr.Write(chEnv)
+
+	var clientRandom [32]byte
+
+	copy(clientRandom[:], chEnv[6:38]) // 4-byte envelope + 2-byte version.
+
+	// Send ServerHello.
+	sh := buildServerHello(serverRandom, suite.ID)
+	r.tr.Write(sh)
+	r.srv.writeHandshake(sh)
+
+	// Send Certificate.
+	cert := buildCertificate([][]byte{testServerCertDER})
+	r.tr.Write(cert)
+	r.srv.writeHandshake(cert)
+
+	// Suite-specific ServerKeyExchange.
+	var preMaster []byte
+
+	switch suite.KX {
+	case suites.KexECDHE:
+		preMaster = r.doECDHE(clientRandom, serverRandom)
+	case suites.KexDHE:
+		preMaster = r.doDHE(clientRandom, serverRandom)
+	case suites.KexRSA:
+		preMaster = r.doRSAKx()
+	case suites.KexGOST2001, suites.KexGOST2012_256, suites.KexGOST2018_256:
+		r.t.Skipf("serverRunner: GOST KX scripted server not yet implemented (suite %d)", suite.KX)
+	default:
+		r.t.Fatalf("serverRunner: unknown KX kind %d", suite.KX)
+	}
+
+	// Derive master secret + key material.
+	var err error
+
+	r.masterSecret, err = suites.MasterSecret(suite, preMaster, clientRandom[:], serverRandom[:])
+	testutil.NoErr(r.t, err, "serverRunner: master secret")
+
+	ivLen := 0
+	if suite.Cipher.AEAD {
+		ivLen = suite.Cipher.FixedIVLen
+	}
+
+	r.km, err = expandKeysForTest(suite, r.masterSecret, clientRandom[:], serverRandom[:], ivLen)
+	testutil.NoErr(r.t, err, "serverRunner: key expansion")
+
+	// Read client CCS.
+	r.srv.readCCS()
+
+	// Install server recv protector (= client write keys).
+	recvProt, err := buildProtectorForTest(suite, r.km.ClientEncKey, r.km.ClientMACKey, r.km.ClientIV)
+	testutil.NoErr(r.t, err, "serverRunner: recv protector")
+
+	r.srv.layer.ChangeCipherSpec(nil, recvProt)
+
+	// Read client Finished (now encrypted).
+	// Per RFC 5246 §7.4.9, server Finished covers all messages including client Finished.
+	finType, _, finEnv := r.srv.readHandshakeMessage()
+	testutil.Equal(r.t, finType, uint8(20), "serverRunner: client Finished message type")
+
+	// Add client Finished to transcript so server Finished verify_data matches.
+	r.tr.Write(finEnv)
+
+	// Send server CCS.
+	r.srv.writeCCS()
+
+	// Install server send protector (= server write keys).
+	sendProt, err := buildProtectorForTest(suite, r.km.ServerEncKey, r.km.ServerMACKey, r.km.ServerIV)
+	testutil.NoErr(r.t, err, "serverRunner: send protector")
+
+	r.srv.layer.ChangeCipherSpec(sendProt, nil)
+
+	// Send server Finished.
+	serverTranscriptHash := r.tr.Sum()
+	serverFinished := buildServerFinished(suite, r.masterSecret, serverTranscriptHash)
+	r.srv.writeHandshake(serverFinished)
+}
+
+func (r *serverRunner) doECDHE(clientRandom, serverRandom [32]byte) []byte {
+	r.t.Helper()
+
+	serverECPriv, err := ecdh.P256().GenerateKey(rand.Reader)
+	testutil.NoErr(r.t, err, "doECDHE: generate key")
+
+	serverECPub := serverECPriv.PublicKey().Bytes()
+
+	ske := buildECDHEServerKeyExchange(serverECPub, clientRandom, serverRandom, testServerKey)
+	r.tr.Write(ske)
+	r.srv.writeHandshake(ske)
+
+	shd := buildServerHelloDone()
+	r.tr.Write(shd)
+	r.srv.writeHandshake(shd)
+
+	// Read CKE.
+	ckeType, ckeBody, ckeEnv := r.srv.readHandshakeMessage()
+	testutil.Equal(r.t, ckeType, uint8(16), "doECDHE: ClientKeyExchange message type")
+
+	r.tr.Write(ckeEnv)
+
+	testutil.MinLen(r.t, ckeBody, 1, "doECDHE: CKE body")
+
+	clientPubLen := int(ckeBody[0])
+	testutil.MinLen(r.t, ckeBody, 1+clientPubLen, "doECDHE: CKE client public key")
+
+	clientPub, err := ecdh.P256().NewPublicKey(ckeBody[1 : 1+clientPubLen])
+	testutil.NoErr(r.t, err, "doECDHE: parse client pub")
+
+	preMaster, err := serverECPriv.ECDH(clientPub)
+	testutil.NoErr(r.t, err, "doECDHE: ECDH")
+
+	return preMaster
+}
+
+func (r *serverRunner) doDHE(clientRandom, serverRandom [32]byte) []byte {
+	r.t.Helper()
+
+	serverPrivX := make([]byte, len(ffdhe2048P))
+
+	_, err := rand.Read(serverPrivX)
+	testutil.NoErr(r.t, err, "doDHE: generate private exponent")
+
+	serverYs, err := ke.DHEComputePublic(ffdhe2048P, ffdhe2048G, serverPrivX)
+	testutil.NoErr(r.t, err, "doDHE: compute ys")
+
+	ske := buildDHEServerKeyExchange(ffdhe2048P, ffdhe2048G, serverYs, clientRandom, serverRandom, testServerKey)
+	r.tr.Write(ske)
+	r.srv.writeHandshake(ske)
+
+	shd := buildServerHelloDone()
+	r.tr.Write(shd)
+	r.srv.writeHandshake(shd)
+
+	// Read CKE.
+	ckeType, ckeBody, ckeEnv := r.srv.readHandshakeMessage()
+	testutil.Equal(r.t, ckeType, uint8(16), "doDHE: ClientKeyExchange message type")
+
+	r.tr.Write(ckeEnv)
+
+	testutil.MinLen(r.t, ckeBody, 2, "doDHE: CKE body")
+
+	ycLen := int(binary.BigEndian.Uint16(ckeBody[:2]))
+	testutil.MinLen(r.t, ckeBody, 2+ycLen, "doDHE: CKE Yc")
+
+	YcBytes := ckeBody[2 : 2+ycLen]
+
+	// Compute Z = Yc^serverPrivX mod p.
+	preMaster, err := ke.DHEComputePublic(ffdhe2048P, YcBytes, serverPrivX)
+	testutil.NoErr(r.t, err, "doDHE: compute shared secret")
+
+	return preMaster
+}
+
+func (r *serverRunner) doRSAKx() []byte {
+	r.t.Helper()
+
+	shd := buildServerHelloDone()
+	r.tr.Write(shd)
+	r.srv.writeHandshake(shd)
+
+	// Read CKE — encrypted pre-master secret.
+	ckeType, ckeBody, ckeEnv := r.srv.readHandshakeMessage()
+	testutil.Equal(r.t, ckeType, uint8(16), "doRSAKx: ClientKeyExchange message type")
+
+	r.tr.Write(ckeEnv)
+
+	// Per RFC 5246 §7.4.7.1, ckeBody = uint16 length prefix || ciphertext.
+	testutil.MinLen(r.t, ckeBody, 2, "doRSAKx: CKE body")
+
+	prefixLen := int(ckeBody[0])<<8 | int(ckeBody[1])
+	if len(ckeBody) != 2+prefixLen {
+		r.t.Fatalf("doRSAKx: CKE length prefix=%d, body len=%d, want %d", prefixLen, len(ckeBody), 2+prefixLen)
+	}
+
+	ciphertext := ckeBody[2:]
+
+	preMaster, err := rsa.DecryptPKCS1v15(rand.Reader, testServerKey, ciphertext)
+	testutil.NoErr(r.t, err, "doRSAKx: decrypt pre-master")
+
+	if len(preMaster) != 48 || preMaster[0] != 0x03 || preMaster[1] != 0x03 {
+		r.t.Fatalf("doRSAKx: bad pre-master format: len=%d", len(preMaster))
+	}
+
+	return preMaster
+}
+
+// ============================================================================
+// runHandshakeTest is the shared orchestrator for basic handshake tests.
+// ============================================================================.
+
+func runHandshakeTest(t *testing.T, suiteName string) (*gostls.Conn, func()) {
+	t.Helper()
+	initTestFixtures(t)
+
+	suite, ok := suites.LookupByName(suiteName)
+	testutil.Ok(t, ok, fmt.Sprintf("LookupByName(%q)", suiteName))
+
+	clientConn, serverConn := net.Pipe()
+
+	var serverRandom [32]byte
+
+	serverRandom[0] = 0xDE
+	serverRandom[1] = 0xAD
+
+	serverDone := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+		defer func() {
+			if r := recover(); r != nil {
+				serverDone <- fmt.Errorf("server panic: %v", r)
+			}
+		}()
+
+		srv := newScriptedServer(t, serverConn)
+		runner := newServerRunner(t, srv, suite)
+		runner.runFullHandshake(serverRandom)
+
+		serverDone <- nil
+	}()
+
+	config := &gostls.Config{
+		ServerName:         "test.example.com",
+		RootCAs:            rootCAsForTest(t),
+		InsecureSkipVerify: false,
+	}
+	tlsConn := gostls.NewConn(clientConn, config)
+
+	cleanup := func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+
+		err := <-serverDone
+		if err != nil {
+			t.Errorf("server error: %v", err)
+		}
+	}
+
+	return tlsConn, cleanup
+}
+
+// ============================================================================
+// Tests
+// ============================================================================.
+
+func TestClient_Handshake_ECDHE_GCM(t *testing.T) {
+	t.Parallel()
+
+	tlsConn, cleanup := runHandshakeTest(t, "ECDHE-RSA-AES128-GCM-SHA256")
+	defer cleanup()
+
+	testutil.NoErr(t, tlsConn.Handshake(), "handshake")
+
+	t.Log("ECDHE-RSA-AES128-GCM-SHA256 handshake succeeded")
+}
+
+func TestClient_Handshake_DHE_CBC(t *testing.T) {
+	t.Parallel()
+
+	tlsConn, cleanup := runHandshakeTest(t, "DHE-RSA-AES256-SHA256")
+	defer cleanup()
+
+	testutil.NoErr(t, tlsConn.Handshake(), "handshake")
+
+	t.Log("DHE-RSA-AES256-SHA256 handshake succeeded")
+}
+
+func TestClient_Handshake_RSA_kx(t *testing.T) {
+	t.Parallel()
+
+	tlsConn, cleanup := runHandshakeTest(t, "AES256-GCM-SHA384")
+	defer cleanup()
+
+	testutil.NoErr(t, tlsConn.Handshake(), "handshake")
+
+	t.Log("AES256-GCM-SHA384 handshake succeeded")
+}
+
+func TestClient_Handshake_ECDHE_CBC(t *testing.T) {
+	t.Parallel()
+
+	tlsConn, cleanup := runHandshakeTest(t, "ECDHE-RSA-AES128-SHA256")
+	defer cleanup()
+
+	testutil.NoErr(t, tlsConn.Handshake(), "handshake")
+
+	t.Log("ECDHE-RSA-AES128-SHA256 handshake succeeded")
+}
+
+func TestClient_Handshake_GOST(t *testing.T) {
+	t.Parallel()
+	// Phase 6/7/8 landed the GOST suites, VKO kx, IMIT/CNT record protector,
+	// and x509gost parse/verify. The handshake wiring (cert path) now also
+	// routes GOST-signed certs through x509gost (always compiled in).
+	// What's still needed to make this a real end-to-end test:
+	//   1. Scripted GOST server (new serverRunner variant that speaks GOST PRF,
+	//      IMIT MAC, CNT cipher, and GOST-VKO key agreement — the fixtures for
+	//      these live in tls/internal/{suites,ke,record}, but no server driver
+	//      composes them yet).
+	//   2. GOST CA + server cert fixtures (x509gost/certbuilder_test.go can
+	//      produce these but they are package-internal to x509gost today).
+	//   3. ClientParams.GOSTRoots wired through Config.GOSTRoots. DONE —
+	//      Config.GOSTRoots/GOSTIntermediates now flow into the handshake
+	//      (see conn.go); only the server driver and fixtures (1, 2) remain.
+	// Items 1 and 2 depend on Phase-10 live capture to lock in wire formats,
+	// so keep the skip for now.
+	t.Skip("deferred: needs scripted GOST server + GOST cert fixtures (Phase 10)")
+}
+
+func TestClient_RejectsUnknownCipher(t *testing.T) {
+	t.Parallel()
+	initTestFixtures(t)
+
+	clientConn, serverConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	var serverRandom [32]byte
+
+	// 0x00FF is not in our offered cipher suites.
+	unknownSuiteID := uint16(0x00FF)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		srv := newScriptedServer(t, serverConn)
+
+		_ = srv.readClientHello()
+
+		sh := buildServerHello(serverRandom, unknownSuiteID)
+		srv.writeHandshake(sh)
+
+		// Drain any alert the client may send.
+		_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+
+		buf := make([]byte, 256)
+
+		_, _ = serverConn.Read(buf)
+	}()
+
+	config := &gostls.Config{
+		ServerName:         "test.example.com",
+		InsecureSkipVerify: true,
+	}
+	tlsConn := gostls.NewConn(clientConn, config)
+
+	err := tlsConn.Handshake()
+	testutil.WantErr(t, err, "handshake with an unknown cipher suite")
+
+	t.Logf("correctly rejected unknown cipher: %v", err)
+}
+
+func TestClient_RejectsBadFinished(t *testing.T) {
+	t.Parallel()
+	initTestFixtures(t)
+
+	suite, ok := suites.LookupByName("ECDHE-RSA-AES128-GCM-SHA256")
+	testutil.Ok(t, ok, `LookupByName("ECDHE-RSA-AES128-GCM-SHA256")`)
+
+	clientConn, serverConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	var serverRandom [32]byte
+
+	serverRandom[0] = 0xBE
+
+	serverDone := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		srv := newScriptedServer(t, serverConn)
+		runner := newServerRunner(t, srv, suite)
+
+		// Run handshake partially — up to and including client Finished.
+		suite := runner.suite
+
+		chEnv := srv.readClientHello()
+		runner.tr.Write(chEnv)
+
+		var clientRandom [32]byte
+
+		copy(clientRandom[:], chEnv[6:38])
+
+		sh := buildServerHello(serverRandom, suite.ID)
+		runner.tr.Write(sh)
+		srv.writeHandshake(sh)
+
+		cert := buildCertificate([][]byte{testServerCertDER})
+		runner.tr.Write(cert)
+		srv.writeHandshake(cert)
+
+		preMaster := runner.doECDHE(clientRandom, serverRandom)
+
+		var err error
+
+		runner.masterSecret, err = suites.MasterSecret(suite, preMaster, clientRandom[:], serverRandom[:])
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		ivLen := suite.Cipher.FixedIVLen
+
+		runner.km, err = expandKeysForTest(suite, runner.masterSecret, clientRandom[:], serverRandom[:], ivLen)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		srv.readCCS()
+
+		recvProt, err := buildProtectorForTest(
+			suite, runner.km.ClientEncKey, runner.km.ClientMACKey, runner.km.ClientIV,
+		)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		srv.layer.ChangeCipherSpec(nil, recvProt)
+		srv.readHandshakeMessage() // client Finished.
+
+		srv.writeCCS()
+
+		sendProt, err := buildProtectorForTest(
+			suite, runner.km.ServerEncKey, runner.km.ServerMACKey, runner.km.ServerIV,
+		)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		srv.layer.ChangeCipherSpec(sendProt, nil)
+
+		// Send a Finished with wrong verify_data (all zeros instead of correct value).
+		badFinished := make([]byte, 12) // all zeros = wrong.
+		srv.writeHandshake(wrapHS(20, badFinished))
+
+		serverDone <- nil
+	}()
+
+	config := &gostls.Config{
+		ServerName:         "test.example.com",
+		InsecureSkipVerify: true,
+	}
+	tlsConn := gostls.NewConn(clientConn, config)
+
+	err := tlsConn.Handshake()
+	testutil.WantErr(t, err, "handshake with a bad server Finished")
+
+	t.Logf("correctly rejected bad server Finished: %v", err)
+
+	serverErr := <-serverDone
+	if serverErr != nil {
+		t.Errorf("server error: %v", serverErr)
+	}
+}
+
+func TestClient_RejectsBadCert(t *testing.T) {
+	t.Parallel()
+	initTestFixtures(t)
+
+	clientConn, serverConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	suite, ok := suites.LookupByName("ECDHE-RSA-AES128-GCM-SHA256")
+	testutil.Ok(t, ok, `LookupByName("ECDHE-RSA-AES128-GCM-SHA256")`)
+
+	var serverRandom [32]byte
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		srv := newScriptedServer(t, serverConn)
+
+		_ = srv.readClientHello()
+
+		sh := buildServerHello(serverRandom, suite.ID)
+		srv.writeHandshake(sh)
+
+		// Generate and send an untrusted self-signed cert.
+		untrustedKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(99),
+			Subject:      pkix.Name{CommonName: "untrusted.example.com"},
+			DNSNames:     []string{"test.example.com"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}
+		certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &untrustedKey.PublicKey, untrustedKey)
+		cert := buildCertificate([][]byte{certDER})
+		srv.writeHandshake(cert)
+
+		// Drain client's fatal alert.
+		_ = serverConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+		buf := make([]byte, 1024)
+
+		_, _ = serverConn.Read(buf)
+	}()
+
+	// Pool trusts only our test CA — the self-signed cert above is not trusted.
+	config := &gostls.Config{
+		ServerName:         "test.example.com",
+		RootCAs:            rootCAsForTest(t),
+		InsecureSkipVerify: false,
+	}
+	tlsConn := gostls.NewConn(clientConn, config)
+
+	err := tlsConn.Handshake()
+	testutil.WantErr(t, err, "handshake with an untrusted certificate")
+
+	t.Logf("correctly rejected bad certificate: %v", err)
+}
+
+func TestClient_Handshake_ApplicationData_RoundTrip(t *testing.T) {
+	t.Parallel()
+	initTestFixtures(t)
+
+	suite, ok := suites.LookupByName("ECDHE-RSA-AES128-GCM-SHA256")
+	testutil.Ok(t, ok, `LookupByName("ECDHE-RSA-AES128-GCM-SHA256")`)
+
+	clientConn, serverConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+
+	var serverRandom [32]byte
+
+	serverRandom[0] = 0xCA
+
+	serverDone := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		srv := newScriptedServer(t, serverConn)
+		runner := newServerRunner(t, srv, suite)
+		runner.runFullHandshake(serverRandom)
+
+		// Echo back whatever the client sends.
+		ct, payload, err := srv.layer.ReadRecord()
+		if err != nil {
+			serverDone <- fmt.Errorf("server: read app data: %w", err)
+			return
+		}
+
+		if ct != record.ContentTypeApplicationData {
+			serverDone <- fmt.Errorf("server: expected app data, got %d", ct)
+			return
+		}
+
+		err = srv.layer.WriteRecord(record.ContentTypeApplicationData, payload)
+		if err != nil {
+			serverDone <- fmt.Errorf("server: echo: %w", err)
+			return
+		}
+
+		serverDone <- nil
+	}()
+
+	config := &gostls.Config{
+		ServerName:         "test.example.com",
+		InsecureSkipVerify: true,
+	}
+	tlsConn := gostls.NewConn(clientConn, config)
+
+	testutil.NoErr(t, tlsConn.Handshake(), "handshake")
+
+	want := []byte("hello")
+
+	_, err := tlsConn.Write(want)
+	testutil.NoErr(t, err, "Write")
+
+	got := make([]byte, len(want))
+
+	_, err = tlsConn.Read(got)
+	testutil.NoErr(t, err, "Read")
+
+	testutil.EqualBytes(t, got, want, "round-trip payload")
+	testutil.NoErr(t, <-serverDone, "server")
+}
+
+func TestClient_Close_SendsCloseNotify(t *testing.T) {
+	t.Parallel()
+	initTestFixtures(t)
+
+	suite, ok := suites.LookupByName("ECDHE-RSA-AES128-GCM-SHA256")
+	testutil.Ok(t, ok, `LookupByName("ECDHE-RSA-AES128-GCM-SHA256")`)
+
+	clientConn, serverConn := net.Pipe()
+
+	defer func() { _ = clientConn.Close() }()
+
+	var serverRandom [32]byte
+
+	serverRandom[0] = 0xAA
+
+	serverDone := make(chan error, 1)
+
+	go func() {
+		defer func() { _ = serverConn.Close() }()
+
+		srv := newScriptedServer(t, serverConn)
+		runner := newServerRunner(t, srv, suite)
+		runner.runFullHandshake(serverRandom)
+
+		// Expect a close_notify alert.
+		ct, payload, err := srv.layer.ReadRecord()
+		if err != nil {
+			serverDone <- fmt.Errorf("server: read close_notify: %w", err)
+			return
+		}
+
+		if ct != record.ContentTypeAlert {
+			serverDone <- fmt.Errorf("server: expected alert record, got %d", ct)
+			return
+		}
+
+		if len(payload) < 2 {
+			serverDone <- errors.New("server: alert too short")
+			return
+		}
+
+		_, desc := record.DecodeAlert(payload)
+		if desc != record.AlertCloseNotify {
+			serverDone <- fmt.Errorf("server: expected close_notify (%d), got desc=%d",
+				record.AlertCloseNotify, desc)
+
+			return
+		}
+
+		serverDone <- nil
+	}()
+
+	config := &gostls.Config{
+		ServerName:         "test.example.com",
+		InsecureSkipVerify: true,
+	}
+	tlsConn := gostls.NewConn(clientConn, config)
+
+	testutil.NoErr(t, tlsConn.Handshake(), "handshake")
+	testutil.NoErr(t, tlsConn.Close(), "Close")
+	testutil.NoErr(t, <-serverDone, "server")
+}
+
+// TestFixture_StdlibTLSAcceptsTestCert sanity-checks that our test CA and
+// server cert work with stdlib crypto/tls.
+func TestFixture_StdlibTLSAcceptsTestCert(t *testing.T) {
+	t.Parallel()
+	initTestFixtures(t)
+
+	tlsCert := tls.Certificate{
+		Certificate: [][]byte{testServerCertDER},
+		PrivateKey:  testServerKey,
+	}
+	// G402 reads MaxVersion as "too low", but pinning it is the point: the
+	// client under test speaks TLS 1.2 only.
+	server := &tls.Config{ //nolint:gosec
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS12,
+	}
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", server)
+	testutil.NoErr(t, err, "listen")
+
+	defer func() { _ = listener.Close() }()
+
+	done := make(chan error, 1)
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+
+			return
+		}
+
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			_ = conn.Close()
+
+			done <- errors.New("accepted conn is not *tls.Conn")
+
+			return
+		}
+
+		_ = tlsConn.HandshakeContext(context.Background())
+		_ = tlsConn.Close()
+
+		done <- nil
+	}()
+
+	clientPool := x509.NewCertPool()
+	clientPool.AppendCertsFromPEM(testCACertPEM)
+
+	dialer := &tls.Dialer{
+		// G402 reads MaxVersion as "too low", but pinning it is the point: this
+		// crypto/tls client stands in for the TLS 1.2-only client under test.
+		Config: &tls.Config{ //nolint:gosec
+			RootCAs:    clientPool,
+			ServerName: "test.example.com",
+			MaxVersion: tls.VersionTLS12,
+		},
+	}
+
+	client, err := dialer.DialContext(context.Background(), "tcp", listener.Addr().String())
+	testutil.NoErr(t, err, "stdlib TLS dial")
+
+	_ = client.Close()
+
+	<-done
+}

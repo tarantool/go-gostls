@@ -1,0 +1,40 @@
+name: interop
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  # Real GOST TLS interop: the pure-Go client handshakes against an OpenSSL
+  # s_server driven by the GOST reference engine. The test is build-tagged
+  # `gostengine` and skips itself when the engine is absent, but here the
+  # engine is built explicitly, so a broken build surfaces as a red job
+  # instead of a silent skip.
+  #
+  # This is the only job needing anything beyond the Go toolchain, and it
+  # builds that dependency from public sources — no corporate infrastructure.
+  gost-interop:
+    if: (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository) ||
+      (github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: ./.github/actions/setup-gost-engine
+
+      - name: gost-engine interop (TestGOSTEngineInterop)
+        run: CGO_ENABLED=0 go test -tags gostengine -run TestGOSTEngineInterop -count=1 ./...

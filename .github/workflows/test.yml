@@ -1,0 +1,80 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Run on every push and on pull requests from forks, but skip pull requests
+    # opened from a branch of this same repository — those are already covered
+    # by the push event, and running both would double every job.
+    if: (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository) ||
+      (github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25", "stable"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      # go-gostls is pure-Go and BSD-2-Clause; go-gostcrypto is pinned by
+      # release tag in go.mod (no replace), so everything resolves from the
+      # public module proxy. Build, vet and test run CGO-free; the race
+      # detector needs cgo, so it gets its own step with CGO_ENABLED=1.
+      - name: build
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: vet
+        run: CGO_ENABLED=0 go vet ./...
+
+      - name: test
+        run: CGO_ENABLED=0 go test -count=1 ./...
+
+      - name: test -race
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+      # Guard against int-width assumptions in the record and handshake length
+      # arithmetic: cross-compile for a 32-bit target where int is 32 bits.
+      - name: build (32-bit linux)
+        run: GOOS=linux GOARCH=386 CGO_ENABLED=0 go build ./...
+
+  coverage:
+    if: (github.event_name == 'push') ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository) ||
+      (github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: collect coverage
+        run: make coverage
+
+      # The module is held above 80% unit-test coverage (the ecosystem's
+      # publication bar). Fail the job rather than let coverage drift down
+      # unnoticed.
+      - name: enforce the 80% coverage floor
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')"
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t >= 80.0) ? 0 : 1 }' \
+            || { echo "::error::coverage ${total}% is below the 80% floor"; exit 1; }

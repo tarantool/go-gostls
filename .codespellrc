@@ -1,0 +1,11 @@
+[codespell]
+
+# CLAUDE.md and TODO.md are untracked local notes; testdata holds binary
+# certificate fixtures.
+skip = ./.git,./CLAUDE.md,./TODO.md,./internal/handshake/testdata,./coverage.out
+
+# gost: the name of the Russian national standard, not a misspelling of "ghost".
+# nd:   the conventional variable name for a net.Dialer, not "and"/"2nd".
+ignore-words-list = gost,gosts,nd
+
+check-filenames = true

@@ -1,0 +1,13 @@
+# Go build output
+/bin/
+*.test
+*.out
+coverage.txt
+coverage.out
+
+# Local AI-assistant guidance, not part of the published module.
+/CLAUDE.md
+/.claude/
+
+# Local backlog notes; tracked work lives in GitHub issues.
+/TODO.md
