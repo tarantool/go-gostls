@@ -3,6 +3,14 @@ version: "2"
 run:
   timeout: 3m
 
+  # Without this the `gostengine` interop test is invisible to the linter — it
+  # is the only tagged file in the module, and a file the default build excludes
+  # is a file no lint rule reaches. The tag only adds files, so listing it here
+  # widens coverage rather than changing how anything else is checked, and the
+  # CI job needs no extra flag.
+  build-tags:
+    - gostengine
+
 formatters:
   enable:
     - goimports
@@ -101,6 +109,22 @@ linters:
       - path: _test\.go
         linters:
           - gochecknoglobals
+
+      # G204/G304 are unsatisfiable in the interop test: it drives a real
+      # `openssl s_server`, so it must exec a binary found at runtime
+      # (OPENSSL_BIN, else a candidate list covering Homebrew and two Linux
+      # layouts) and read the cert that binary just wrote into t.TempDir().
+      # gosec flags any non-literal command or path, so no validation silences
+      # it — only hardcoding an openssl location would, which is exactly the
+      # portability the file header promises.
+      - path: gostengine_interop_test\.go
+        source: exec\.CommandContext\(ctx, openssl
+        linters:
+          - gosec
+      - path: gostengine_interop_test\.go
+        source: os\.ReadFile\(certPath\)
+        linters:
+          - gosec
 
       # G115 (integer truncation) only, and only in tests: fixture builders
       # hand-assemble wire bytes, including deliberately malformed ones for the

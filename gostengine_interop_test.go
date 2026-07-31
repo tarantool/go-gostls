@@ -73,7 +73,8 @@ func firstExisting(env string, candidates []string) string {
 	}
 
 	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
+		_, err := os.Stat(c)
+		if err == nil {
 			return c
 		}
 	}
@@ -117,7 +118,8 @@ default_algorithms = ALL
 
 	probe.Env = append(os.Environ(), "OPENSSL_CONF="+conf)
 
-	if out, err := probe.CombinedOutput(); err != nil || !strings.Contains(string(out), "available") {
+	out, err := probe.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "available") {
 		t.Skipf("GOST engine not loadable: %v\n%s", err, out)
 	}
 
@@ -132,7 +134,8 @@ func runOpenSSL(ctx context.Context, t *testing.T, openssl, conf string, args ..
 
 	cmd.Env = append(os.Environ(), "OPENSSL_CONF="+conf)
 
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("openssl %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
