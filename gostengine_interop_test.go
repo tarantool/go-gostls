@@ -21,6 +21,7 @@ package gostls_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/pem"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -199,24 +201,7 @@ func TestGOSTEngineInterop(t *testing.T) {
 		t.Run(sc.opensslCipher, func(t *testing.T) {
 			t.Parallel()
 
-			port := freePort(ctx, t)
-			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-
-			// Launch an openssl s_server pinned to this one GOST cipher.
-			srv := exec.CommandContext(ctx, openssl,
-				"s_server", "-accept", strconv.Itoa(port),
-				"-cert", certPath, "-key", keyPath,
-				"-tls1_2", "-cipher", sc.opensslCipher, "-www",
-			)
-
-			srv.Env = append(os.Environ(), "OPENSSL_CONF="+conf)
-
-			testutil.NoErr(t, srv.Start(), "start s_server")
-
-			defer func() { _ = srv.Process.Kill(); _ = srv.Wait() }()
-
-			// Wait for the listener.
-			waitListen(ctx, t, addr)
+			addr := startGOSTServer(ctx, t, openssl, conf, sc.opensslCipher, certPath, keyPath)
 
 			cfg := &gostls.Config{
 				ServerName:   "localhost",
@@ -251,23 +236,129 @@ func TestGOSTEngineInterop(t *testing.T) {
 	}
 }
 
-// waitListen blocks until addr accepts a TCP connection or the deadline passes.
-func waitListen(ctx context.Context, t *testing.T, addr string) {
+const (
+	// acceptLine is what `openssl s_server` prints on stdout once its listening
+	// socket is bound.
+	acceptLine = "ACCEPT"
+
+	serverStartTimeout  = 15 * time.Second
+	serverStartAttempts = 3
+)
+
+// startGOSTServer launches an `openssl s_server` pinned to a single GOST cipher
+// and returns the address to dial once it is listening. The server is killed
+// via t.Cleanup.
+//
+// Readiness comes from the ACCEPT line, not from probing the port: s_server
+// accepts a probe connection and starts a handshake on it, and `-www` serves
+// connections serially, so a probe that closes immediately leaves the server
+// unwinding a failed handshake while the real dial lands — a flaky
+// "connection reset by peer" reading ServerHello.
+//
+// freePort holds a port only long enough to read its number, so a sibling
+// parallel subtest can take it before the bind. s_server then exits without
+// printing ACCEPT; retry on a fresh port.
+func startGOSTServer(ctx context.Context, t *testing.T, openssl, conf, cipher, certPath, keyPath string) string {
 	t.Helper()
 
-	var d net.Dialer
+	for attempt := 1; ; attempt++ {
+		port := freePort(ctx, t)
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		c, err := d.DialContext(ctx, "tcp", addr)
-		if err == nil {
-			_ = c.Close()
+		srv := exec.CommandContext(ctx, openssl,
+			"s_server", "-accept", strconv.Itoa(port),
+			"-cert", certPath, "-key", keyPath,
+			"-tls1_2", "-cipher", cipher, "-www",
+		)
 
-			return
+		srv.Env = append(os.Environ(), "OPENSSL_CONF="+conf)
+
+		// exec guarantees one Write at a time when Stdout == Stderr.
+		w := newAcceptWatcher()
+
+		srv.Stdout = w
+		srv.Stderr = w
+
+		testutil.NoErr(t, srv.Start(), "start s_server")
+
+		// The only Wait; cleanup drains the same channel. Catches a startup
+		// death without waiting out the timeout.
+		exited := make(chan error, 1)
+
+		go func() { exited <- srv.Wait() }()
+
+		timer := time.NewTimer(serverStartTimeout)
+
+		var ready bool
+
+		select {
+		case <-w.accepted:
+			ready = true
+		case <-exited:
+		case <-timer.C:
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		timer.Stop()
+
+		if ready {
+			t.Cleanup(func() { _ = srv.Process.Kill(); <-exited })
+
+			return addr
+		}
+
+		_ = srv.Process.Kill()
+
+		<-exited
+
+		if attempt == serverStartAttempts {
+			t.Fatalf("s_server never reported %s on %s after %d attempts; output:\n%s",
+				acceptLine, addr, attempt, w.output())
+		}
+	}
+}
+
+// acceptWatcher closes accepted the first time acceptLine appears in what is
+// written to it, retaining the output for diagnostics.
+//
+// An io.Writer rather than a Cmd.StdoutPipe reader: exec then keeps draining
+// the server on its own (`-www` logs a line per connection, and a stalled pipe
+// would block it mid-handshake), and nothing races Cmd.Wait.
+type acceptWatcher struct {
+	accepted chan struct{}
+	once     sync.Once
+
+	mu   sync.Mutex
+	seen bool
+	buf  bytes.Buffer
+}
+
+func newAcceptWatcher() *acceptWatcher {
+	return &acceptWatcher{accepted: make(chan struct{})}
+}
+
+func (w *acceptWatcher) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.buf.Write(p)
+
+	// Scanning the whole buffer, so a split write cannot hide acceptLine.
+	found := !w.seen && bytes.Contains(w.buf.Bytes(), []byte(acceptLine))
+
+	if found {
+		w.seen = true
 	}
 
-	t.Fatalf("s_server did not start listening on %s", addr)
+	w.mu.Unlock()
+
+	if found {
+		w.once.Do(func() { close(w.accepted) })
+	}
+
+	return len(p), nil
+}
+
+func (w *acceptWatcher) output() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.buf.String()
 }
