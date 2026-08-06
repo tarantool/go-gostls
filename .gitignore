@@ -11,3 +11,6 @@ coverage.out
 
 # Local backlog notes; tracked work lives in GitHub issues.
 /TODO.md
+
+# Local git worktrees.
+/.worktrees/
