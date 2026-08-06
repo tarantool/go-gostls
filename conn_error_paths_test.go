@@ -10,8 +10,10 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"testing"
 	"time"
@@ -657,6 +659,65 @@ func TestConfig_ClientCerts_MalformedDER(t *testing.T) {
 	testutil.WantErr(t, hsErr, "Handshake with a malformed client certificate DER")
 
 	t.Logf("correctly rejected malformed DER: %v", hsErr)
+}
+
+// TestConfig_ClientCerts_MalformedDER_WithLeaf pins that a pre-populated Leaf
+// does not buy the chain an exemption from validation. Leaf is inspection-only
+// metadata; Certificate[0] is what the peer receives. Gating the parse on Leaf
+// being nil would mean a config ported from crypto/tls — where X509KeyPair
+// fills Leaf in — silently skips the check and fails later as an opaque alert
+// from the server.
+func TestConfig_ClientCerts_MalformedDER_WithLeaf(t *testing.T) {
+	t.Parallel()
+
+	client, server := net.Pipe()
+
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	go func() {
+		buf := make([]byte, 64)
+
+		_, _ = server.Read(buf)
+
+		_ = server.Close()
+	}()
+
+	rsaKey, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	testutil.NoErr(t, err, "generate RSA key")
+
+	// A genuine parsed certificate for Leaf, so the only thing wrong is the DER
+	// that would actually go on the wire.
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+
+	der, err := x509.CreateCertificate(cryptorand.Reader, tmpl, tmpl, &rsaKey.PublicKey, rsaKey)
+	testutil.NoErr(t, err, "create cert")
+
+	leaf, err := x509.ParseCertificate(der)
+	testutil.NoErr(t, err, "parse cert")
+
+	cfg := &Config{
+		Certificates: []Certificate{
+			{
+				Certificate: [][]byte{{0x01, 0x02, 0x03, 0x04}},
+				Leaf:        leaf,
+				PrivateKey:  rsaKey,
+			},
+		},
+		InsecureSkipVerify: true,
+	}
+
+	c := newConn(client, cfg)
+
+	hsErr := c.Handshake()
+	testutil.WantErr(t, hsErr, "Handshake with malformed DER and a pre-populated Leaf")
+
+	t.Logf("correctly rejected malformed DER despite Leaf being set: %v", hsErr)
 }
 
 // TestConfig_ClientCerts_EmptyChainEntry covers the per-entry validation in

@@ -70,9 +70,10 @@ type Certificate struct {
 	// public key. Required when using mutual TLS (client authentication).
 	PrivateKey crypto.PrivateKey
 
-	// Leaf is the parsed leaf certificate, i.e. Certificate[0]. It is optional
-	// and is used for inspection only, never for what goes on the wire. When
-	// nil, Certificate[0] is parsed on demand at handshake time.
+	// Leaf is the parsed leaf certificate, i.e. Certificate[0]. It is optional,
+	// is never consulted by this package, and never substitutes for the DER in
+	// Certificate — which is what actually goes on the wire, and which is
+	// validated at handshake start whether Leaf is set or not.
 	Leaf *x509.Certificate
 }
 
@@ -371,8 +372,10 @@ func (c *Config) rootCAPool() (*x509.CertPool, error) {
 //   - Certificate must hold at least one entry, and every entry must be
 //     non-empty. The chain is what gets placed on the wire; a pre-populated
 //     Leaf is auxiliary metadata and does not substitute for the DER bytes.
-//   - When Leaf is nil, Certificate[0] is parsed, which also rejects a chain
-//     whose leaf is not a certificate at all.
+//   - Certificate[0] must parse, which rejects a chain whose leaf is not a
+//     certificate at all. This runs whether or not Leaf is set: Leaf says what
+//     the caller believes the leaf to be, the chain is what the peer will
+//     actually receive, and only the second one can be wrong on the wire.
 //
 // Returns (nil, nil) when Certificates is empty.
 func (c *Config) clientCerts() ([]handshake.ClientCertificate, error) {
@@ -406,11 +409,15 @@ func (c *Config) clientCerts() ([]handshake.ClientCertificate, error) {
 			}
 		}
 
-		if cert.Leaf == nil {
-			_, err := x509.ParseCertificate(cert.Certificate[0])
-			if err != nil {
-				return nil, fmt.Errorf("tls: Certificates[%d].Certificate[0]: %w", i, err)
-			}
+		// Unconditional: gating this on Leaf being nil would let the presence of
+		// an inspection-only field decide whether the bytes headed for the wire
+		// are checked at all. crypto/tls populates Leaf from X509KeyPair, so a
+		// ported config arrives with it set — exactly the case where a mismatched
+		// or truncated chain would otherwise sail past and fail at the peer as an
+		// opaque alert.
+		_, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return nil, fmt.Errorf("tls: Certificates[%d].Certificate[0]: %w", i, err)
 		}
 
 		result = append(result, handshake.ClientCertificate{
