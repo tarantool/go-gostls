@@ -7,18 +7,22 @@ import (
 	"time"
 )
 
-// backendTag identifies which backend was compiled in.
-// Used by tests to assert the correct code path is linked.
+// backendTag is the identifier this module reports for itself.
+// It is a constant: gostls is the pure-Go backend and there is no second
+// backend here to switch between.
 const backendTag = "default"
 
-// BackendTag returns a string identifying the TLS backend compiled into this
-// binary: "default" for the pure-Go backend, "openssl" for the CGO backend.
+// BackendTag returns the identifier of the TLS backend this module implements,
+// always "default" — the pure-Go one. The tag exists for the caller that does
+// have a choice: go-tlsdialer picks between gostls and its cgo OpenSSL backend
+// and reports which one it ended up with. This module carries no second
+// backend, so the value never varies.
 func BackendTag() string { return backendTag }
 
 // dialBackend implements the pure-Go TLS backend.
 // It dials a raw TCP connection using netDialer (or a zero-value net.Dialer
 // if nil), then performs the TLS 1.2 handshake implemented in this package.
-func dialBackend(ctx context.Context, network, addr string, netDialer *net.Dialer, cfg *Config) (net.Conn, error) {
+func dialBackend(ctx context.Context, network, addr string, netDialer *net.Dialer, cfg *Config) (*Conn, error) {
 	nd := netDialer
 	if nd == nil {
 		nd = &net.Dialer{}

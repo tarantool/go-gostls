@@ -1,5 +1,5 @@
 // Error-path and negative-path tests for conn.go / dialer.go /
-// dialer_default.go. These tests lift branches that were not covered by the
+// dialer_impl.go. These tests lift branches that were not covered by the
 // existing handshake_test.go / conn_test.go / dialer_dial_test.go.
 
 //nolint:testpackage // white-box: accesses unexported newConn, handshakeOnce, closed fields
@@ -500,7 +500,7 @@ func TestDialer_DialContext_NilConfig(t *testing.T) {
 	testutil.WantErr(t, err, "DialContext with a cancelled context")
 }
 
-// dialer_default.go dialBackend — handshake-failure path.
+// dialer_impl.go dialBackend — handshake-failure path.
 
 // TestDialBackend_HandshakeFailureClosesConn verifies that when dialBackend
 // opens a raw TCP connection but the TLS handshake fails, the raw connection is
