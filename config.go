@@ -30,20 +30,30 @@ var (
 	errCertUnsupportedKeyType = errors.New(
 		"tls: Certificates: PrivateKey has unsupported type; want *rsa.PrivateKey or *ecdsa.PrivateKey",
 	)
-	// errCertEmptyRaw is wrapped with the cert index.
-	errCertEmptyRaw = errors.New("tls: Certificates: RawCertificate is empty")
+	// errCertEmptyChain is wrapped with the cert index.
+	errCertEmptyChain = errors.New("tls: Certificates: Certificate chain is empty")
+	// errCertEmptyChainEntry is wrapped with the cert index and the chain index.
+	errCertEmptyChainEntry = errors.New("tls: Certificates: Certificate chain entry is empty")
 )
 
-// Certificate holds a certificate and its private key.
-// Mirrors crypto/tls.Certificate in structure.
+// Certificate holds a certificate chain and its private key.
+// The field layout matches crypto/tls.Certificate, so a value built for
+// crypto/tls can be assigned field by field without reshaping.
 type Certificate struct {
-	// Certificate is the parsed certificate (optional; used for display only).
-	Certificate *x509.Certificate
-	// RawCertificate holds the DER-encoded certificate.
-	RawCertificate []byte
-	// PrivateKey is the private key corresponding to the certificate's public
-	// key. Required when using mutual TLS (client authentication).
+	// Certificate holds the DER-encoded certificate chain: the leaf first,
+	// followed by any intermediates needed to let the peer build a path to a
+	// CA it trusts. The chain is sent verbatim in the client Certificate
+	// message. At least one entry is required, and no entry may be empty.
+	Certificate [][]byte
+
+	// PrivateKey is the private key corresponding to the leaf certificate's
+	// public key. Required when using mutual TLS (client authentication).
 	PrivateKey crypto.PrivateKey
+
+	// Leaf is the parsed leaf certificate, i.e. Certificate[0]. It is optional
+	// and is used for inspection only, never for what goes on the wire. When
+	// nil, Certificate[0] is parsed on demand at handshake time.
+	Leaf *x509.Certificate
 }
 
 // Config is the TLS 1.2 client configuration. Field names and semantics
@@ -83,14 +93,14 @@ type Config struct {
 
 	// Certificates contains client certificates for mutual TLS (mTLS) client
 	// authentication. When the server sends a CertificateRequest during the
-	// handshake, the first entry in this slice is offered. If the server's
-	// requested signature algorithms do not include any algorithm supported by
-	// the key, an empty Certificate message is sent (which is valid per RFC 5246).
+	// handshake, the first entry in this slice is offered, chain included. If
+	// the server's requested signature algorithms do not include any algorithm
+	// supported by the key, an empty Certificate message is sent (which is
+	// valid per RFC 5246).
 	//
 	// Each Certificate.PrivateKey must be *rsa.PrivateKey or *ecdsa.PrivateKey;
-	// any other type causes Handshake() to return a hard error. If
-	// Certificate.Certificate is nil, RawCertificate is parsed on demand; an
-	// empty RawCertificate is a hard error.
+	// any other type causes Handshake() to return a hard error. So does an
+	// empty Certificate chain or an empty entry within it.
 	Certificates []Certificate
 
 	// ServerName is the server name sent in the SNI extension and used for
@@ -219,10 +229,11 @@ func (c *Config) rootCAPool() (*x509.CertPool, error) {
 //
 // Validation rules (hard errors — fail loud at handshake start):
 //   - PrivateKey must be *rsa.PrivateKey or *ecdsa.PrivateKey.
-//   - RawCertificate must be non-empty. It is what gets placed on the wire;
-//     a pre-populated Certificate field is auxiliary metadata and does not
-//     substitute for the DER bytes.
-//   - When Certificate is nil, RawCertificate is parsed to populate it.
+//   - Certificate must hold at least one entry, and every entry must be
+//     non-empty. The chain is what gets placed on the wire; a pre-populated
+//     Leaf is auxiliary metadata and does not substitute for the DER bytes.
+//   - When Leaf is nil, Certificate[0] is parsed, which also rejects a chain
+//     whose leaf is not a certificate at all.
 //
 // Returns (nil, nil) when Certificates is empty.
 func (c *Config) clientCerts() ([]handshake.ClientCertificate, error) {
@@ -242,28 +253,30 @@ func (c *Config) clientCerts() ([]handshake.ClientCertificate, error) {
 			)
 		}
 
-		// RawCertificate is what gets emitted on the wire; validate
-		// unconditionally, regardless of whether Certificate is pre-parsed.
-		// A nil/empty RawCertificate with a non-nil Certificate would otherwise
-		// produce a malformed zero-length certificate entry (RFC 5246 §7.4.2
-		// requires each entry in the list to be at least 1 byte).
-		if len(cert.RawCertificate) == 0 {
-			return nil, fmt.Errorf("tls: Certificates[%d]: %w", i, errCertEmptyRaw)
+		// The chain is what gets emitted on the wire; validate unconditionally,
+		// regardless of whether Leaf is pre-parsed. An empty entry would
+		// otherwise produce a malformed zero-length certificate entry (RFC 5246
+		// §7.4.2 requires each entry in the list to be at least 1 byte).
+		if len(cert.Certificate) == 0 {
+			return nil, fmt.Errorf("tls: Certificates[%d]: %w", i, errCertEmptyChain)
 		}
 
-		if cert.Certificate == nil {
-			parsed, err := x509.ParseCertificate(cert.RawCertificate)
-			if err != nil {
-				return nil, fmt.Errorf("tls: Certificates[%d].RawCertificate: %w", i, err)
+		for j, der := range cert.Certificate {
+			if len(der) == 0 {
+				return nil, fmt.Errorf("tls: Certificates[%d].Certificate[%d]: %w", i, j, errCertEmptyChainEntry)
 			}
+		}
 
-			cert.Certificate = parsed
+		if cert.Leaf == nil {
+			_, err := x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				return nil, fmt.Errorf("tls: Certificates[%d].Certificate[0]: %w", i, err)
+			}
 		}
 
 		result = append(result, handshake.ClientCertificate{
-			RawCertificate: cert.RawCertificate,
-			PrivateKey:     cert.PrivateKey,
-			Certificate:    cert.Certificate,
+			RawChain:   cert.Certificate,
+			PrivateKey: cert.PrivateKey,
 		})
 	}
 

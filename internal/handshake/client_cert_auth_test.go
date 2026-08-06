@@ -582,7 +582,7 @@ func TestSendClientCertificate_OneRSACert(t *testing.T) {
 	c := &ClientState{
 		params: ClientParams{
 			Certificates: []ClientCertificate{
-				{RawCertificate: der, PrivateKey: rsaKey},
+				{RawChain: [][]byte{der}, PrivateKey: rsaKey},
 			},
 		},
 		layer:      layer,
@@ -616,6 +616,67 @@ func TestSendClientCertificate_OneRSACert(t *testing.T) {
 	// The DER cert bytes must appear in the payload.
 	if !bytes.Contains(payload, der) {
 		t.Errorf("payload does not contain the DER cert bytes\npayload=%x\nder=%x", payload, der)
+	}
+}
+
+// TestSendClientCertificate_Chain verifies that a multi-entry RawChain is
+// emitted in full and in order: leaf first, then intermediates. A server that
+// does not hold the intermediate cannot build a path without them, so dropping
+// anything past the leaf silently breaks client authentication.
+func TestSendClientCertificate_Chain(t *testing.T) {
+	t.Parallel()
+
+	rsaKey, _, leafDER := newTestRSACert(t)
+	_, _, intermediateDER := newTestRSACert(t)
+
+	chain := [][]byte{leafDER, intermediateDER}
+
+	layer, w := makeRecordLayerWithCapture()
+
+	c := &ClientState{
+		params: ClientParams{
+			Certificates: []ClientCertificate{
+				{RawChain: chain, PrivateKey: rsaKey},
+			},
+		},
+		layer:      layer,
+		transcript: NewTranscript(),
+		certReq: &CertificateRequest{
+			SupportedSignatureAlgs: []SigAndHash{
+				{Hash: 0x04, Sig: 0x01}, // sha256+rsa.
+			},
+		},
+	}
+
+	sent, err := c.sendClientCertificate()
+	testutil.NoErr(t, err, "sendClientCertificate")
+
+	testutil.Ok(t, sent, "sendClientCertificate: chain")
+
+	written := w.Bytes()
+	testutil.MinLen(t, written, 5, "sendClientCertificate: record header")
+
+	payloadLen := int(written[3])<<8 | int(written[4])
+	testutil.MinLen(t, written, 5+payloadLen, "sendClientCertificate: record body")
+
+	msg, rest, err := ParseMessage(written[5 : 5+payloadLen])
+	testutil.NoErr(t, err, "ParseMessage")
+
+	if len(rest) != 0 {
+		t.Errorf("ParseMessage left %d trailing bytes, want 0", len(rest))
+	}
+
+	certMsg, ok := msg.(*Certificate)
+	if !ok {
+		t.Fatalf("parsed message is %T, want *Certificate", msg)
+	}
+
+	if len(certMsg.RawCerts) != len(chain) {
+		t.Fatalf("Certificate carries %d entries, want %d", len(certMsg.RawCerts), len(chain))
+	}
+
+	for i := range chain {
+		testutil.EqualBytes(t, certMsg.RawCerts[i], chain[i], fmt.Sprintf("chain entry %d", i))
 	}
 }
 

@@ -495,7 +495,7 @@ func TestSendClientCertificate_WriteError(t *testing.T) {
 	c := &ClientState{
 		params: ClientParams{
 			Certificates: []ClientCertificate{
-				{RawCertificate: der, PrivateKey: rsaKey},
+				{RawChain: [][]byte{der}, PrivateKey: rsaKey},
 			},
 		},
 		layer:      layer,

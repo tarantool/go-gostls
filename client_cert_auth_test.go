@@ -311,7 +311,7 @@ func TestClient_Handshake_WithCertAuth_RSACert(t *testing.T) {
 		ServerName: "test.example.com",
 		RootCAs:    rootCAsForTest(t),
 		Certificates: []gostls.Certificate{
-			{RawCertificate: clientDER, PrivateKey: clientKey},
+			{Certificate: [][]byte{clientDER}, PrivateKey: clientKey},
 		},
 	}
 	tlsConn := gostls.NewConn(clientConn, config)
@@ -413,7 +413,7 @@ func TestClient_Handshake_NoCertReq_CertConfigured(t *testing.T) {
 		ServerName: "test.example.com",
 		RootCAs:    rootCAsForTest(t),
 		Certificates: []gostls.Certificate{
-			{RawCertificate: clientDER, PrivateKey: clientKey},
+			{Certificate: [][]byte{clientDER}, PrivateKey: clientKey},
 		},
 	}
 	tlsConn := gostls.NewConn(clientConn, config)
@@ -458,7 +458,7 @@ func TestClient_Handshake_WithCertAuth_VerifiesSignature(t *testing.T) {
 		ServerName: "test.example.com",
 		RootCAs:    rootCAsForTest(t),
 		Certificates: []gostls.Certificate{
-			{RawCertificate: clientDER, PrivateKey: clientKey},
+			{Certificate: [][]byte{clientDER}, PrivateKey: clientKey},
 		},
 	}
 	tlsConn := gostls.NewConn(clientConn, config)
@@ -502,8 +502,10 @@ func TestClient_Config_ClientCerts_InvalidKeyType(t *testing.T) {
 	config := &gostls.Config{
 		Certificates: []gostls.Certificate{
 			{
-				RawCertificate: []byte{0x01}, // non-empty but invalid DER (won't be parsed for this test).
-				PrivateKey:     fakeKey{},
+				// Non-empty but invalid DER; the key-type check rejects the
+				// entry before the chain is ever parsed.
+				Certificate: [][]byte{{0x01}},
+				PrivateKey:  fakeKey{},
 			},
 		},
 		InsecureSkipVerify: true,
@@ -532,9 +534,9 @@ func TestClient_Config_ClientCerts_InvalidKeyType(t *testing.T) {
 	t.Logf("correctly rejected unsupported key type: %v", err)
 }
 
-// TestClient_Config_ClientCerts_EmptyRawCertificate tests that empty
-// RawCertificate (with no Certificate set) is a hard error.
-func TestClient_Config_ClientCerts_EmptyRawCertificate(t *testing.T) {
+// TestClient_Config_ClientCerts_EmptyChain tests that an empty Certificate
+// chain (with no Leaf set) is a hard error.
+func TestClient_Config_ClientCerts_EmptyChain(t *testing.T) {
 	t.Parallel()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -543,8 +545,8 @@ func TestClient_Config_ClientCerts_EmptyRawCertificate(t *testing.T) {
 	config := &gostls.Config{
 		Certificates: []gostls.Certificate{
 			{
-				RawCertificate: nil, // empty — hard error.
-				PrivateKey:     key,
+				Certificate: nil, // empty — hard error.
+				PrivateKey:  key,
 			},
 		},
 		InsecureSkipVerify: true,
@@ -566,26 +568,25 @@ func TestClient_Config_ClientCerts_EmptyRawCertificate(t *testing.T) {
 	tlsConn := gostls.NewConn(clientConn, config)
 
 	err = tlsConn.Handshake()
-	testutil.WantErr(t, err, "handshake with an empty RawCertificate")
+	testutil.WantErr(t, err, "handshake with an empty Certificate chain")
 
-	t.Logf("correctly rejected empty RawCertificate: %v", err)
+	t.Logf("correctly rejected empty Certificate chain: %v", err)
 }
 
-// TestClient_Config_ClientCerts_EmptyRawCertificate_WithParsedCertificate
-// covers the path where the caller pre-parses x509.Certificate but leaves
-// RawCertificate nil. RawCertificate is what goes on the wire; a zero-length
-// entry would be a malformed Certificate message per RFC 5246 §7.4.2, so
-// clientCerts() must still reject — validation cannot be skipped when
-// Certificate is non-nil.
-func TestClient_Config_ClientCerts_EmptyRawCertificate_WithParsedCertificate(t *testing.T) {
+// TestClient_Config_ClientCerts_EmptyChain_WithLeaf covers the path where the
+// caller pre-parses Leaf but leaves the Certificate chain nil. The chain is
+// what goes on the wire; a zero-length entry would be a malformed Certificate
+// message per RFC 5246 §7.4.2, so clientCerts() must still reject —
+// validation cannot be skipped when Leaf is non-nil.
+func TestClient_Config_ClientCerts_EmptyChain_WithLeaf(t *testing.T) {
 	t.Parallel()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	testutil.NoErr(t, err, "generate RSA key")
 
 	// Generate a real cert just so we have a valid *x509.Certificate to
-	// populate the Certificate field; the bug path is RawCertificate being
-	// nil while Certificate is non-nil.
+	// populate Leaf; the bug path is the Certificate chain being nil while
+	// Leaf is non-nil.
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "test"},
@@ -602,9 +603,9 @@ func TestClient_Config_ClientCerts_EmptyRawCertificate_WithParsedCertificate(t *
 	config := &gostls.Config{
 		Certificates: []gostls.Certificate{
 			{
-				Certificate:    parsed, // pre-parsed, non-nil.
-				RawCertificate: nil,    // but DER bytes missing — hard error.
-				PrivateKey:     key,
+				Leaf:        parsed, // pre-parsed, non-nil.
+				Certificate: nil,    // but DER bytes missing — hard error.
+				PrivateKey:  key,
 			},
 		},
 		InsecureSkipVerify: true,
@@ -626,7 +627,7 @@ func TestClient_Config_ClientCerts_EmptyRawCertificate_WithParsedCertificate(t *
 	tlsConn := gostls.NewConn(clientConn, config)
 
 	err = tlsConn.Handshake()
-	testutil.WantErr(t, err, "handshake with an empty RawCertificate and a parsed Certificate")
+	testutil.WantErr(t, err, "handshake with an empty Certificate chain and a parsed Leaf")
 
-	t.Logf("correctly rejected empty RawCertificate + parsed Certificate: %v", err)
+	t.Logf("correctly rejected empty Certificate chain + parsed Leaf: %v", err)
 }
