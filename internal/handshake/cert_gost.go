@@ -23,21 +23,35 @@ var ErrGOSTRootsRequired = errors.New("tls: GOST-signed server certificate but n
 // key, and dropping it would leave callers of a GOST handshake — the reason
 // this module exists — unable to inspect the peer at all.
 //
-// Every entry must parse. x509gost.ParseCertificate handles GOST and non-GOST
-// certificates alike, so a failure here means malformed DER, which is a
-// protocol error regardless of the configured trust settings.
+// The two parses are held to different standards, and that asymmetry is the
+// point. The stdlib parse must succeed: that is the bar crypto/tls holds a peer
+// certificate to, and failing it means malformed DER, which is a protocol error
+// regardless of the configured trust settings. The GOST parse is best effort,
+// because x509gost is deliberately stricter than crypto/x509 — it rejects a
+// GOST signature over a non-GOST public key, and an unknown curve paramset.
+// Those are legal certificates that a mixed GOST/RSA PKI really issues (a GOST
+// root cross-signing a non-GOST sub-CA is the standard transitional shape), and
+// they usually turn up as intermediates the chain does not even need. Failing
+// the handshake over one would break connections that have nothing to do with
+// GOST, including under InsecureSkipVerify, which is the setting callers reach
+// for precisely when the PKI is irregular. A slot the GOST view cannot express
+// stays nil; verification still applies its own, stricter rules to the leaf.
 func (c *ClientState) recordPeerChain(rawCerts [][]byte) error {
 	stdlibChain := make([]*x509.Certificate, len(rawCerts))
 	gostChain := make([]*x509gost.Certificate, len(rawCerts))
 
 	for i, der := range rawCerts {
-		cert, err := x509gost.ParseCertificate(der)
+		stdlibCert, err := x509.ParseCertificate(der)
 		if err != nil {
 			return fmt.Errorf("parse server certificate %d: %w", i, err)
 		}
 
-		stdlibChain[i] = cert.Stdlib
-		gostChain[i] = cert
+		stdlibChain[i] = stdlibCert
+
+		gostCert, gostErr := x509gost.ParseCertificate(der)
+		if gostErr == nil {
+			gostChain[i] = gostCert
+		}
 	}
 
 	c.peerCertificates = stdlibChain

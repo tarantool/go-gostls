@@ -47,7 +47,11 @@ type ConnectionState struct {
 	PeerCertificates []*x509.Certificate
 
 	// GOSTPeerCertificates is the same chain, in the same order, parsed as
-	// x509gost certificates.
+	// x509gost certificates. An entry is nil when that certificate is one
+	// x509gost declines to parse but crypto/x509 accepts — a GOST signature
+	// over a non-GOST key, or an unknown curve paramset. Such certificates are
+	// legal and do occur in mixed PKIs, so they do not fail the handshake;
+	// they simply have no GOST view. PeerCertificates is never sparse.
 	GOSTPeerCertificates []*x509gost.Certificate
 }
 

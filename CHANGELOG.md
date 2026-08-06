@@ -23,9 +23,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
-- A server certificate that does not parse now fails the handshake even under
-  `InsecureSkipVerify`, matching `crypto/tls`. Malformed DER is a protocol
-  error, which is a separate question from whether the chain is trusted (#3).
+- A server certificate that does not parse as X.509 now fails the handshake even
+  under `InsecureSkipVerify`, matching `crypto/tls`. Malformed DER is a protocol
+  error, which is a separate question from whether the chain is trusted. A
+  certificate `crypto/x509` accepts but `x509gost` does not — a GOST signature
+  over a non-GOST key, an unknown paramset — is not malformed and does not fail
+  the handshake; it simply has no entry in `GOSTPeerCertificates` (#3).
+- Client `Certificate` chains are no longer capped at one TLS record. Handshake
+  messages fragment across records as RFC 5246 §6.2.1 requires, so a chain over
+  ~16 KB is sendable instead of failing locally (#4).
 
 - A `NetDialer`'s `Timeout` and `Deadline` now bound the TLS handshake as well
   as the TCP connect, matching `crypto/tls`. Previously they bounded only the
