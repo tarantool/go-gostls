@@ -309,6 +309,11 @@ func (c *Conn) doHandshake() error {
 		return errNoSuites
 	}
 
+	err := c.config.checkVersions()
+	if err != nil {
+		return err
+	}
+
 	rootCAs, err := c.config.rootCAPool()
 	if err != nil {
 		return err
