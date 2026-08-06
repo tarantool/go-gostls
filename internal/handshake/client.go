@@ -16,19 +16,17 @@ import (
 	"github.com/tarantool/go-gostls/internal/suites"
 )
 
-// ClientCertificate holds a client certificate and its private key for mutual
-// TLS authentication. It mirrors tls.Certificate in structure but is internal
-// to the handshake package.
+// ClientCertificate holds a client certificate chain and its private key for
+// mutual TLS authentication. It mirrors tls.Certificate in structure but is
+// internal to the handshake package.
 type ClientCertificate struct {
-	// RawCertificate holds the DER-encoded certificate. Must be non-empty when
-	// used for authentication.
-	RawCertificate []byte
-	// PrivateKey is the private key corresponding to the certificate's public
-	// key. Must be *rsa.PrivateKey or *ecdsa.PrivateKey.
+	// RawChain holds the DER-encoded certificate chain, leaf first. It is
+	// emitted verbatim in the client Certificate message, so it must hold at
+	// least one entry and no entry may be empty. The caller validates this.
+	RawChain [][]byte
+	// PrivateKey is the private key corresponding to the leaf certificate's
+	// public key. Must be *rsa.PrivateKey or *ecdsa.PrivateKey.
 	PrivateKey crypto.PrivateKey
-	// Certificate is the parsed certificate (optional; parsed from RawCertificate
-	// on demand if nil).
-	Certificate *x509.Certificate
 }
 
 // sigHashSHA256RSA is sha256+rsa_pkcs1.
@@ -1033,8 +1031,8 @@ func (c *ClientState) selectClientSigAlg() (SigAndHash, bool) {
 //
 //   - If len(c.params.Certificates) == 0 or selectClientSigAlg returned false:
 //     emits an empty Certificate message and returns (false, nil).
-//   - Otherwise: emits a single-entry Certificate with Certificates[0].RawCertificate
-//     and returns (true, nil).
+//   - Otherwise: emits a Certificate carrying Certificates[0].RawChain in full
+//     (leaf first, then intermediates) and returns (true, nil).
 //
 // The message is appended to the transcript in either case.
 func (c *ClientState) sendClientCertificate() (sent bool, err error) {
@@ -1049,7 +1047,7 @@ func (c *ClientState) sendClientCertificate() (sent bool, err error) {
 		certMsg = &Certificate{}
 	} else {
 		certMsg = &Certificate{
-			RawCerts: [][]byte{c.params.Certificates[0].RawCertificate},
+			RawCerts: c.params.Certificates[0].RawChain,
 		}
 	}
 

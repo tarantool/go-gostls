@@ -616,8 +616,8 @@ func TestConfig_Rand_CustomSource(t *testing.T) {
 // config.go clientCerts — malformed DER branch (ParseCertificate error).
 
 // TestConfig_ClientCerts_MalformedDER exercises the x509.ParseCertificate
-// error path in clientCerts() when RawCertificate contains invalid DER bytes
-// and Certificate is nil (so the code tries to parse it).
+// error path in clientCerts() when Certificate[0] contains invalid DER bytes
+// and Leaf is nil (so the code tries to parse it).
 func TestConfig_ClientCerts_MalformedDER(t *testing.T) {
 	t.Parallel()
 
@@ -642,10 +642,10 @@ func TestConfig_ClientCerts_MalformedDER(t *testing.T) {
 		Certificates: []Certificate{
 			{
 				// Non-empty but invalid DER — x509.ParseCertificate will fail.
-				RawCertificate: []byte{0x01, 0x02, 0x03, 0x04},
-				// Certificate is nil → triggers the parse path in clientCerts().
-				Certificate: nil,
-				PrivateKey:  rsaKey,
+				Certificate: [][]byte{{0x01, 0x02, 0x03, 0x04}},
+				// Leaf is nil → triggers the parse path in clientCerts().
+				Leaf:       nil,
+				PrivateKey: rsaKey,
 			},
 		},
 		InsecureSkipVerify: true,
@@ -657,4 +657,48 @@ func TestConfig_ClientCerts_MalformedDER(t *testing.T) {
 	testutil.WantErr(t, hsErr, "Handshake with a malformed client certificate DER")
 
 	t.Logf("correctly rejected malformed DER: %v", hsErr)
+}
+
+// TestConfig_ClientCerts_EmptyChainEntry covers the per-entry validation in
+// clientCerts(): an empty intermediate would be emitted as a zero-length entry
+// in the Certificate message, which RFC 5246 §7.4.2 forbids. The leaf being
+// valid must not let it through.
+func TestConfig_ClientCerts_EmptyChainEntry(t *testing.T) {
+	t.Parallel()
+
+	client, server := net.Pipe()
+
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	go func() {
+		buf := make([]byte, 64)
+
+		_, _ = server.Read(buf)
+
+		_ = server.Close()
+	}()
+
+	rsaKey, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	testutil.NoErr(t, err, "generate RSA key")
+
+	cfg := &Config{
+		Certificates: []Certificate{
+			{
+				// Leaf is fine; the intermediate slot is empty.
+				Certificate: [][]byte{{0x01, 0x02, 0x03, 0x04}, {}},
+				PrivateKey:  rsaKey,
+			},
+		},
+		InsecureSkipVerify: true,
+	}
+
+	c := newConn(client, cfg)
+
+	hsErr := c.Handshake()
+	testutil.WantErr(t, hsErr, "Handshake with an empty chain entry")
+
+	if !errors.Is(hsErr, errCertEmptyChainEntry) {
+		t.Errorf("Handshake error = %v, want it to wrap errCertEmptyChainEntry", hsErr)
+	}
 }
