@@ -3,7 +3,6 @@ package gostls
 
 import (
 	"context"
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -11,34 +10,6 @@ import (
 	"github.com/tarantool/go-gostls/internal/record"
 	"github.com/tarantool/go-gostls/internal/testutil"
 )
-
-// stallingListener starts a TCP listener whose connections accept (and discard)
-// data but never reply, simulating a peer that stalls during the TLS handshake.
-func stallingListener(t *testing.T) net.Listener {
-	t.Helper()
-
-	lc := &net.ListenConfig{}
-
-	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	testutil.NoErr(t, err, "listen")
-
-	go func() {
-		for {
-			conn, acceptErr := ln.Accept()
-			if acceptErr != nil {
-				return
-			}
-
-			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
-
-				_, _ = io.Copy(io.Discard, c)
-			}(conn)
-		}
-	}()
-
-	return ln
-}
 
 // TestConn_Handshake_FailsClosedWithoutServerName covers H1: with verification
 // enabled and no ServerName (and none derived from a dial address), the
@@ -64,8 +35,7 @@ func TestConn_Handshake_FailsClosedWithoutServerName(t *testing.T) {
 func TestDialContext_DerivesServerNameFromAddr(t *testing.T) {
 	t.Parallel()
 
-	ln := stallingListener(t)
-	t.Cleanup(func() { _ = ln.Close() })
+	ln := testutil.StallingListener(t)
 
 	d := &Dialer{Config: &Config{}}
 
@@ -83,8 +53,7 @@ func TestDialContext_DerivesServerNameFromAddr(t *testing.T) {
 func TestConn_Close_InterruptsInFlightHandshake(t *testing.T) {
 	t.Parallel()
 
-	ln := stallingListener(t)
-	t.Cleanup(func() { _ = ln.Close() })
+	ln := testutil.StallingListener(t)
 
 	var nd net.Dialer
 

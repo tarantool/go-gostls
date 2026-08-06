@@ -2,7 +2,6 @@ package gostls_test
 
 import (
 	"context"
-	"io"
 	"net"
 	"sync/atomic"
 	"syscall"
@@ -42,35 +41,6 @@ func roundTrip(t *testing.T, conn net.Conn) {
 	testutil.NoErr(t, err, "Read")
 
 	testutil.EqualBytes(t, got, want, "round-trip payload")
-}
-
-// startStallingTCPListener accepts connections, drains whatever the client
-// sends and never replies — a peer that completes the TCP connect and then
-// hangs mid-handshake.
-func startStallingTCPListener(t *testing.T) net.Listener {
-	t.Helper()
-
-	lc := &net.ListenConfig{}
-
-	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	testutil.NoErr(t, err, "listen")
-
-	go func() {
-		for {
-			conn, acceptErr := ln.Accept()
-			if acceptErr != nil {
-				return // listener closed.
-			}
-
-			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
-
-				_, _ = io.Copy(io.Discard, c)
-			}(conn)
-		}
-	}()
-
-	return ln
 }
 
 // TestDialer_Dial_Success dials a real stdlib TLS 1.2 server through
@@ -190,21 +160,37 @@ func TestDialWithDialer_UsesSuppliedDialer(t *testing.T) {
 func TestDialWithDialer_TimeoutCoversHandshake(t *testing.T) {
 	t.Parallel()
 
-	ln := startStallingTCPListener(t)
-
-	defer func() { _ = ln.Close() }()
+	ln := testutil.StallingListener(t)
 
 	nd := &net.Dialer{Timeout: 300 * time.Millisecond}
 
-	start := time.Now()
+	type dialResult struct {
+		conn *gostls.Conn
+		err  error
+	}
 
-	_, err := gostls.DialWithDialer(nd, "tcp", ln.Addr().String(), &gostls.Config{InsecureSkipVerify: true})
-	elapsed := time.Since(start)
+	// The regression this guards against is a dial that never comes back, so
+	// the call cannot run on the test goroutine: measuring the elapsed time
+	// afterwards only works if there is an afterwards. Off-goroutine plus a
+	// timer turns the hang into this test's failure instead of the package-wide
+	// panic timeout. The channel is buffered so that a dial which does return
+	// later still finds a receiver and its goroutine ends.
+	done := make(chan dialResult, 1)
 
-	testutil.WantErr(t, err, "DialWithDialer against a stalling peer")
+	go func() {
+		conn, err := gostls.DialWithDialer(nd, "tcp", ln.Addr().String(), &gostls.Config{InsecureSkipVerify: true})
+		done <- dialResult{conn: conn, err: err}
+	}()
 
-	if elapsed > 2*time.Second {
-		t.Fatalf("DialWithDialer blocked %v despite a 300ms dialer timeout (handshake unbounded)", elapsed)
+	select {
+	case res := <-done:
+		if res.conn != nil {
+			_ = res.conn.Close()
+		}
+
+		testutil.WantErr(t, res.err, "DialWithDialer against a stalling peer")
+	case <-time.After(2 * time.Second):
+		t.Fatal("DialWithDialer had not returned after 2s despite a 300ms dialer timeout (handshake unbounded)")
 	}
 }
 
