@@ -15,6 +15,37 @@ import (
 // InsecureSkipVerify to bypass verification entirely.
 var ErrGOSTRootsRequired = errors.New("tls: GOST-signed server certificate but no GOSTRoots configured")
 
+// recordPeerChain parses every certificate the server sent and stores the
+// chain on the state, so a completed handshake can report who it talked to.
+//
+// Both views are kept. The stdlib view is what portable code expects; the
+// x509gost view is the only one that can express a GOST signature or public
+// key, and dropping it would leave callers of a GOST handshake — the reason
+// this module exists — unable to inspect the peer at all.
+//
+// Every entry must parse. x509gost.ParseCertificate handles GOST and non-GOST
+// certificates alike, so a failure here means malformed DER, which is a
+// protocol error regardless of the configured trust settings.
+func (c *ClientState) recordPeerChain(rawCerts [][]byte) error {
+	stdlibChain := make([]*x509.Certificate, len(rawCerts))
+	gostChain := make([]*x509gost.Certificate, len(rawCerts))
+
+	for i, der := range rawCerts {
+		cert, err := x509gost.ParseCertificate(der)
+		if err != nil {
+			return fmt.Errorf("parse server certificate %d: %w", i, err)
+		}
+
+		stdlibChain[i] = cert.Stdlib
+		gostChain[i] = cert
+	}
+
+	c.peerCertificates = stdlibChain
+	c.gostPeerCertificates = gostChain
+
+	return nil
+}
+
 // parseAndVerifyLeaf verifies a server certificate given only the leaf DER,
 // with no server-supplied intermediates. It is a thin wrapper over
 // parseAndVerifyChain retained for callers (and tests) that hold just the leaf.

@@ -84,6 +84,12 @@ type Conn struct {
 	// used as the effective ServerName when Config.ServerName is empty (matching
 	// crypto/tls.Dialer). Empty for connections created via NewConn.
 	serverNameFromDial string
+
+	// connState holds the snapshot ConnectionState hands out. It is an atomic
+	// pointer because callers read it from goroutines other than the one that
+	// ran the handshake — logging the negotiated suite from a monitoring
+	// goroutine is the obvious case.
+	connState atomic.Pointer[ConnectionState]
 }
 
 // NewConn creates a Conn wrapping the given net.Conn with the provided Config.
@@ -358,5 +364,12 @@ func (c *Conn) doHandshake() error {
 
 	state := handshake.NewClientState(c.layer, params)
 
-	return state.Handshake()
+	err = state.Handshake()
+	if err != nil {
+		return err
+	}
+
+	c.publishConnectionState(state.Result(), serverName)
+
+	return nil
 }

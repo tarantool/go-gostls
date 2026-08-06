@@ -17,8 +17,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `Config.Clone()` (#6).
 - `Dialer.Dial`, the package-level `Dial` and `DialWithDialer`, and `Client` as
   the `crypto/tls` spelling of `NewConn` (#7).
+- `Conn.ConnectionState()`, reporting the negotiated version and suite, the
+  effective server name and the peer chain — in stdlib shape and, for the GOST
+  key and signature, as `GOSTPeerCertificates` (#3).
 
 ### Changed
+
+- A server certificate that does not parse now fails the handshake even under
+  `InsecureSkipVerify`, matching `crypto/tls`. Malformed DER is a protocol
+  error, which is a separate question from whether the chain is trusted (#3).
 
 - A `NetDialer`'s `Timeout` and `Deadline` now bound the TLS handshake as well
   as the TCP connect, matching `crypto/tls`. Previously they bounded only the

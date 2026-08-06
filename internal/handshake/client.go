@@ -171,6 +171,16 @@ type ClientState struct {
 	// every importer of the package.
 	gostLeaf any
 
+	// peerCertificates is the server's chain, leaf first, in stdlib shape.
+	// Populated by recordPeerChain from the Certificate message.
+	peerCertificates []*x509.Certificate
+
+	// gostPeerCertificates is the same chain as []*x509gost.Certificate, kept
+	// because the GOST view carries the GOST public key and signature details
+	// that the stdlib view cannot represent. Typed as any for the same reason
+	// as gostLeaf.
+	gostPeerCertificates any
+
 	// Set after handshake completes.
 	done bool
 
@@ -541,6 +551,15 @@ func (c *ClientState) recvCertificate() (*x509.Certificate, *Certificate, error)
 
 	if len(certMsg.RawCerts) == 0 {
 		return nil, nil, c.fatal(record.AlertBadCertificate, errEmptyCertList)
+	}
+
+	// Parse the whole chain up front, before verification decides what to do
+	// with it. Like crypto/tls, a certificate the peer sent that does not parse
+	// is a protocol error even under InsecureSkipVerify: the bytes are
+	// malformed, which is a different question from whether they are trusted.
+	err = c.recordPeerChain(certMsg.RawCerts)
+	if err != nil {
+		return nil, nil, c.fatal(record.AlertBadCertificate, fmt.Errorf("tls: %w", err))
 	}
 
 	// Parse the leaf certificate and verify the chain. parseAndVerifyLeaf is
