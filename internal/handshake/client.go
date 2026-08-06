@@ -277,7 +277,7 @@ func (c *ClientState) Handshake() error {
 		return c.fatal(record.AlertInternalError, err)
 	}
 
-	err = c.layer.WriteRecord(record.ContentTypeHandshake, ckeEnv)
+	err = c.writeHandshakeMessage(ckeEnv)
 	if err != nil {
 		return c.fatal(record.AlertInternalError, fmt.Errorf("tls: send ClientKeyExchange: %w", err))
 	}
@@ -320,7 +320,7 @@ func (c *ClientState) Handshake() error {
 		return c.fatal(record.AlertInternalError, err)
 	}
 
-	err = c.layer.WriteRecord(record.ContentTypeHandshake, clientFinishedEnv)
+	err = c.writeHandshakeMessage(clientFinishedEnv)
 	if err != nil {
 		return c.fatal(record.AlertInternalError, fmt.Errorf("tls: send client Finished: %w", err))
 	}
@@ -435,7 +435,7 @@ func (c *ClientState) sendClientHello() error {
 		return c.fatal(record.AlertInternalError, err)
 	}
 
-	err = c.layer.WriteRecord(record.ContentTypeHandshake, env)
+	err = c.writeHandshakeMessage(env)
 	if err != nil {
 		return fmt.Errorf("tls: send ClientHello: %w", err)
 	}
@@ -1075,7 +1075,7 @@ func (c *ClientState) sendClientCertificate() (sent bool, err error) {
 		return false, c.fatal(record.AlertInternalError, marshalErr)
 	}
 
-	writeErr := c.layer.WriteRecord(record.ContentTypeHandshake, env)
+	writeErr := c.writeHandshakeMessage(env)
 	if writeErr != nil {
 		return false, c.fatal(record.AlertInternalError, fmt.Errorf("tls: send client Certificate: %w", writeErr))
 	}
@@ -1129,7 +1129,7 @@ func (c *ClientState) sendCertificateVerify(alg SigAndHash) error {
 		return c.fatal(record.AlertInternalError, err)
 	}
 
-	err = c.layer.WriteRecord(record.ContentTypeHandshake, env)
+	err = c.writeHandshakeMessage(env)
 	if err != nil {
 		return c.fatal(record.AlertInternalError, fmt.Errorf("tls: send CertificateVerify: %w", err))
 	}
@@ -1204,6 +1204,42 @@ func (c *ClientState) fatal(alertDesc uint8, cause error) error {
 	_ = c.layer.WriteRecord(record.ContentTypeAlert, alertBody)
 
 	return cause
+}
+
+// writeHandshakeMessage sends one marshaled handshake envelope, splitting it
+// over as many records as it takes.
+//
+// RFC 5246 §6.2.1 caps a TLSPlaintext fragment at 2^14 bytes and lets a single
+// handshake message span several records; record.Layer.WriteRecord enforces the
+// cap but never fragments, so the split has to happen here. Until it did, the
+// two directions disagreed: readHandshakeRecord reassembles a message of up to
+// maxHandshakeMsg from consecutive records, while the send path could not emit
+// anything past 2^14 bytes at all — reachable in practice by a client
+// Certificate carrying a full chain.
+//
+// The transcript is deliberately not this function's business: fragmentation is
+// a wire-framing concern and the transcript always hashes the whole envelope,
+// so callers keep feeding env to c.transcript themselves. Errors come back raw
+// for the same reason — each caller wraps them with its own message and sends
+// its own alert.
+func (c *ClientState) writeHandshakeMessage(env []byte) error {
+	const maxChunk = 1 << 14 // 16384 bytes.
+
+	for len(env) > 0 {
+		chunk := env
+		if len(chunk) > maxChunk {
+			chunk = chunk[:maxChunk]
+		}
+
+		err := c.layer.WriteRecord(record.ContentTypeHandshake, chunk)
+		if err != nil {
+			return err
+		}
+
+		env = env[len(chunk):]
+	}
+
+	return nil
 }
 
 // maxHandshakeMsg bounds a single reassembled handshake message body. A
