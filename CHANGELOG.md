@@ -15,8 +15,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   `VersionTLS13` constants. The module still speaks TLS 1.2 only; a bound that
   excludes it fails the handshake instead of being ignored (#8).
 - `Config.Clone()` (#6).
+- `Dialer.Dial`, the package-level `Dial` and `DialWithDialer`, and `Client` as
+  the `crypto/tls` spelling of `NewConn` (#7).
 
 ### Changed
+
+- A `NetDialer`'s `Timeout` and `Deadline` now bound the TLS handshake as well
+  as the TCP connect, matching `crypto/tls`. Previously they bounded only the
+  connect, leaving a handshake against a silent peer unbounded (#7).
 
 - **Breaking:** `Certificate` matches the `crypto/tls.Certificate` field
   layout. `Certificate.Certificate` is now `[][]byte` (DER chain, leaf first),
