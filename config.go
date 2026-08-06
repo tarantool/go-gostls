@@ -1,6 +1,7 @@
 package gostls
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/tarantool/go-gostcrypto/x509gost"
 
@@ -34,6 +36,24 @@ var (
 	errCertEmptyChain = errors.New("tls: Certificates: Certificate chain is empty")
 	// errCertEmptyChainEntry is wrapped with the cert index and the chain index.
 	errCertEmptyChainEntry = errors.New("tls: Certificates: Certificate chain entry is empty")
+	// errVersionRangeExcludesTLS12 is wrapped with the configured bounds when
+	// Config.MinVersion/MaxVersion rule out the one version this module speaks.
+	errVersionRangeExcludesTLS12 = errors.New("tls: gostls supports TLS 1.2 only")
+)
+
+// TLS protocol version numbers, spelled and valued as in crypto/tls.
+//
+// This module implements TLS 1.2 and nothing else, so VersionTLS12 is the only
+// version Config.MinVersion/MaxVersion can actually select. The neighbouring
+// constants exist for source compatibility: code carrying the usual
+// `MinVersion: tls.VersionTLS12` hygiene line — or any other bound — keeps
+// compiling after the package is swapped, and a bound that excludes TLS 1.2 is
+// reported at handshake time instead of being silently ignored.
+const (
+	VersionTLS10 = 0x0301
+	VersionTLS11 = 0x0302
+	VersionTLS12 = 0x0303
+	VersionTLS13 = 0x0304
 )
 
 // Certificate holds a certificate chain and its private key.
@@ -136,6 +156,125 @@ type Config struct {
 	// If nil, crypto/rand.Reader is used (the correct default for production).
 	// Override in tests to produce deterministic handshake bytes.
 	Rand io.Reader
+
+	// MinVersion is the lowest TLS version the caller is willing to accept.
+	// Zero means "unset", which is the only value with no effect on behaviour:
+	// the handshake always negotiates TLS 1.2 regardless.
+	//
+	// The field exists so that configurations written against crypto/tls port
+	// over unchanged. A non-zero bound is honoured to the extent it can be —
+	// one that excludes TLS 1.2 fails the handshake rather than being ignored.
+	MinVersion uint16
+
+	// MaxVersion is the highest TLS version the caller is willing to accept.
+	// Zero means "unset". See MinVersion for why the field exists and what a
+	// non-zero value does.
+	MaxVersion uint16
+}
+
+// Clone returns a copy of c that shares no slice with the original: the slice
+// fields are copied element by element, down to the DER chains inside
+// Certificates, so appending to or overwriting a clone's slices cannot be
+// observed through c.
+//
+// Pointer-valued and interface-valued fields are shared, not duplicated —
+// RootCAs, the x509gost certificates in GOSTRoots/GOSTIntermediates, each
+// Certificate's PrivateKey and Leaf, Rand and VerifyPeerCertificate. They are
+// configuration handed in by the caller and treated as immutable once set,
+// which is exactly how crypto/tls.Config.Clone treats its own.
+//
+// A nil receiver clones to nil, so an unset *Config can be passed through
+// Clone without a guard at the call site.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+
+	// Spelled out field by field rather than as `clone := *c`. A struct copy
+	// would pick up a newly added field silently — and share its slice with the
+	// original — whereas an exhaustive literal leaves the field zero, which is
+	// what the field sweep in config_clone_test.go detects.
+	return &Config{
+		RootCAs:               c.RootCAs,
+		RootCAPEMs:            cloneByteSlices(c.RootCAPEMs),
+		GOSTRoots:             slices.Clone(c.GOSTRoots),
+		GOSTIntermediates:     slices.Clone(c.GOSTIntermediates),
+		Certificates:          cloneCertificates(c.Certificates),
+		ServerName:            c.ServerName,
+		CipherSuites:          slices.Clone(c.CipherSuites),
+		InsecureSkipVerify:    c.InsecureSkipVerify,
+		VerifyPeerCertificate: c.VerifyPeerCertificate,
+		Rand:                  c.Rand,
+		MinVersion:            c.MinVersion,
+		MaxVersion:            c.MaxVersion,
+	}
+}
+
+// cloneByteSlices copies both levels of a [][]byte. slices.Clone would copy
+// only the outer one, leaving the byte slices themselves shared.
+func cloneByteSlices(s [][]byte) [][]byte {
+	if s == nil {
+		return nil
+	}
+
+	out := make([][]byte, len(s))
+	for i, b := range s {
+		out[i] = bytes.Clone(b)
+	}
+
+	return out
+}
+
+// cloneCertificates copies a Certificate slice, including each entry's DER
+// chain. The private key and the parsed leaf are shared, as documented on Clone.
+func cloneCertificates(certs []Certificate) []Certificate {
+	if certs == nil {
+		return nil
+	}
+
+	out := make([]Certificate, len(certs))
+	for i, cert := range certs {
+		out[i] = cert
+		out[i].Certificate = cloneByteSlices(cert.Certificate)
+	}
+
+	return out
+}
+
+// checkVersions reports whether the configured MinVersion/MaxVersion range can
+// still contain TLS 1.2, the only version this module negotiates. Silently
+// ignoring a range that rules it out would turn a deliberate policy — "TLS 1.3
+// or nothing" — into a downgrade the caller never agreed to, so the handshake
+// fails instead.
+//
+// A zero bound is "unset" and constrains nothing.
+func (c *Config) checkVersions() error {
+	if c == nil {
+		return nil
+	}
+
+	if c.MinVersion != 0 && c.MinVersion > VersionTLS12 {
+		return fmt.Errorf(
+			"tls: Config.MinVersion is 0x%04x, above TLS 1.2 (0x%04x): %w",
+			c.MinVersion, VersionTLS12, errVersionRangeExcludesTLS12,
+		)
+	}
+
+	if c.MaxVersion != 0 && c.MaxVersion < VersionTLS12 {
+		return fmt.Errorf(
+			"tls: Config.MaxVersion is 0x%04x, below TLS 1.2 (0x%04x): %w",
+			c.MaxVersion, VersionTLS12, errVersionRangeExcludesTLS12,
+		)
+	}
+
+	if c.MinVersion != 0 && c.MaxVersion != 0 && c.MinVersion > c.MaxVersion {
+		return fmt.Errorf(
+			"tls: Config.MinVersion 0x%04x is above Config.MaxVersion 0x%04x: %w",
+			c.MinVersion, c.MaxVersion, errVersionRangeExcludesTLS12,
+		)
+	}
+
+	return nil
 }
 
 // rand returns the configured random source, defaulting to crypto/rand.Reader.

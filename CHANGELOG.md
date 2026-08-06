@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - `Certificate.Certificate` now carries a full DER chain, so client
   authentication can present intermediates (#4).
+- `Config.MinVersion` / `Config.MaxVersion`, plus the `VersionTLS10`…
+  `VersionTLS13` constants. The module still speaks TLS 1.2 only; a bound that
+  excludes it fails the handshake instead of being ignored (#8).
+- `Config.Clone()` (#6).
 
 ### Changed
 
