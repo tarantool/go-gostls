@@ -9,38 +9,50 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
-- `Certificate.Certificate` now carries a full DER chain, so client
-  authentication can present intermediates (#4).
+### Changed
+
+### Fixed
+
+## [v0.1.0] - 2026-08-06
+
+First public release of go-gostls: a pure-Go, BSD-2-Clause TLS 1.2 client
+shaped like `crypto/tls`, speaking both the ordinary AES / ECDHE /
+ChaCha20-Poly1305 suites and the GOST suites the standard library does not,
+with no OpenSSL, no cgo and no GPL in the module graph.
+
+### Added
+
+- Initial public release of `go-gostls`: a pure-Go TLS 1.2 client shaped like
+  `crypto/tls` — `Config`, `Conn` and `Dialer`, with `NewConn` and its
+  `crypto/tls` spelling `Client`, the package-level `Dial` and
+  `DialWithDialer`, and `Dialer.Dial` / `Dialer.DialContext` (#7).
+- GOST cipher suites: `GOST2001-GOST89-GOST89`,
+  `GOST2012-GOST8912-GOST8912`, `GOST2012-MAGMA-MAGMAOMAC` and
+  `GOST2012-KUZNYECHIK-KUZNYECHIKOMAC`.
+- Standard cipher suites: ECDHE / DHE / RSA key exchange with AES-CBC,
+  AES-GCM and ChaCha20-Poly1305 record protection.
+- GOST key exchange: VKO GOST 2001 / 2012 and GOST-2018 key transport.
+- Record protection: GOST 28147-89 CNT+IMIT and CTR-OMAC over Kuznyechik and
+  Magma, with CTR-ACPKM rekeying.
+- Certificate verification: `RootCAs` / `RootCAPEMs` for ordinary chains and
+  `GOSTRoots` / `GOSTIntermediates` for GOST-signed ones (`x509gost`). A
+  server certificate that does not parse as X.509 fails the handshake even
+  under `InsecureSkipVerify`, matching `crypto/tls`; a certificate
+  `crypto/x509` accepts but `x509gost` does not simply has no entry in
+  `GOSTPeerCertificates` (#3).
+- Mutual TLS client authentication through `Config.Certificates`, laid out as
+  `crypto/tls.Certificate`: `Certificate` is a `[][]byte` DER chain (leaf
+  first) and the parsed leaf lives in `Leaf`, so intermediates can be
+  presented. Handshake messages fragment across records as RFC 5246 §6.2.1
+  requires, so a chain over ~16 KB is sendable (#4).
 - `Config.MinVersion` / `Config.MaxVersion`, plus the `VersionTLS10`…
-  `VersionTLS13` constants. The module still speaks TLS 1.2 only; a bound that
+  `VersionTLS13` constants. The module speaks TLS 1.2 only; a bound that
   excludes it fails the handshake instead of being ignored (#8).
 - `Config.Clone()` (#6).
-- `Dialer.Dial`, the package-level `Dial` and `DialWithDialer`, and `Client` as
-  the `crypto/tls` spelling of `NewConn` (#7).
 - `Conn.ConnectionState()`, reporting the negotiated version and suite, the
   effective server name and the peer chain — in stdlib shape and, for the GOST
   key and signature, as `GOSTPeerCertificates` (#3).
-
-### Changed
-
-- A server certificate that does not parse as X.509 now fails the handshake even
-  under `InsecureSkipVerify`, matching `crypto/tls`. Malformed DER is a protocol
-  error, which is a separate question from whether the chain is trusted. A
-  certificate `crypto/x509` accepts but `x509gost` does not — a GOST signature
-  over a non-GOST key, an unknown paramset — is not malformed and does not fail
-  the handshake; it simply has no entry in `GOSTPeerCertificates` (#3).
-- Client `Certificate` chains are no longer capped at one TLS record. Handshake
-  messages fragment across records as RFC 5246 §6.2.1 requires, so a chain over
-  ~16 KB is sendable instead of failing locally (#4).
-
-- A `NetDialer`'s `Timeout` and `Deadline` now bound the TLS handshake as well
-  as the TCP connect, matching `crypto/tls`. Previously they bounded only the
-  connect, leaving a handshake against a silent peer unbounded (#7).
-
-- **Breaking:** `Certificate` matches the `crypto/tls.Certificate` field
-  layout. `Certificate.Certificate` is now `[][]byte` (DER chain, leaf first),
-  the parsed leaf moved to `Certificate.Leaf`, and `RawCertificate` is gone.
-  Migration: `RawCertificate: der` becomes `Certificate: [][]byte{der}`, and
-  `Certificate: parsed` becomes `Leaf: parsed` (#4).
-
-### Fixed
+- A `NetDialer`'s `Timeout` and `Deadline` bound the TLS handshake as well as
+  the TCP connect, matching `crypto/tls` (#7).
+- Suite registry helpers `AllSuites()` and `LookupSuiteByName()`, plus the
+  build identifier `BackendTag()`.
