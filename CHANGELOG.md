@@ -11,23 +11,35 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+### Fixed
+
+## [v0.1.1] - 2026-10-30
+
+Two handshake failures that hid the server's reason now report it: an alert
+the server sends instead of its ChangeCipherSpec comes back the way
+`crypto/tls` reports it, and the client's second flight leaves in one write,
+so a server that closes on the client certificate no longer turns the failure
+into a broken pipe.
+
+### Changed
+
 - An alert the server sends during the handshake is reported the way
   `crypto/tls` reports it: a `*net.OpError` with `Op` `"remote error"` whose
   text names the alert, e.g. `remote error: tls: handshake failure`. It used
-  to read `tls: received alert level=2 desc=40`.
+  to read `tls: received alert level=2 desc=40` (#30).
 
 ### Fixed
 
 - A server that answers the client's second flight with an alert instead of
   its ChangeCipherSpec — a mutual-TLS server rejecting a missing client
   certificate, for one — is reported as that alert, not as
-  `tls: expected ChangeCipherSpec, got content type 21`.
+  `tls: expected ChangeCipherSpec, got content type 21` (#30).
 - The client's second flight — Certificate, ClientKeyExchange,
   CertificateVerify, ChangeCipherSpec, Finished — is sent in one write, as
   `crypto/tls` and OpenSSL send it. A server that rejects the client
   certificate closes the connection as soon as it has read it, and the client
   used to fail now and then on writing the rest of the flight
-  (`write: broken pipe`) instead of reading the server's alert.
+  (`write: broken pipe`) instead of reading the server's alert (#30).
 
 ## [v0.1.0] - 2026-08-06
 
