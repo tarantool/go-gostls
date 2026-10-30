@@ -115,7 +115,6 @@ var (
 	errKeyExpansionZero      = errors.New("tls: key expansion total length is zero for suite")
 	errHSBodyTruncated       = errors.New("tls: handshake body truncated")
 	errAlertRecordTruncated  = errors.New("tls: alert record truncated")
-	errAlertReceived         = errors.New("tls: received alert")
 	errUnexpectedRecordType  = errors.New("tls: unexpected record type during handshake")
 	errInterleavedHandshake  = errors.New("tls: non-handshake record interleaved with a fragmented handshake message")
 	errKeyExpansionZeroLocal = errors.New("key expansion total length is zero")

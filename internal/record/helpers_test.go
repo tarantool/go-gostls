@@ -3,6 +3,8 @@ package record_test
 import (
 	"crypto/sha1" //nolint:gosec // testing SHA1Hash which wraps the legacy function
 	"crypto/sha512"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tarantool/go-gostls/internal/record"
@@ -133,6 +135,69 @@ func TestAlertError_ErrorString(t *testing.T) {
 			t.Errorf("AlertError{level=%d, desc=%d}.Error() = %q, want %q",
 				tc.level, tc.desc, got, tc.want)
 		}
+	}
+}
+
+// TestRemoteAlertError_ErrorString verifies a peer's alert reads the way
+// crypto/tls reports it: named, not numbered, and without the level.
+func TestRemoteAlertError_ErrorString(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		desc  uint8
+		level uint8
+		want  string
+	}{
+		{record.AlertHandshakeFailure, record.AlertLevelFatal, "tls: handshake failure"},
+		{record.AlertBadCertificate, record.AlertLevelFatal, "tls: bad certificate"},
+		{record.AlertUnknownCA, record.AlertLevelFatal, "tls: unknown certificate authority"},
+		{record.AlertCertificateRequired, record.AlertLevelFatal, "tls: certificate required"},
+		{record.AlertNoRenegotiation, record.AlertLevelWarning, "tls: no renegotiation"},
+		{41, record.AlertLevelFatal, "tls: alert(41)"}, // no_certificate, SSLv3 only.
+		{255, record.AlertLevelFatal, "tls: alert(255)"},
+	}
+
+	for _, tc := range cases {
+		ae := &record.RemoteAlertError{Level: tc.level, Description: tc.desc}
+
+		testutil.Equal(t, ae.Error(), tc.want, fmt.Sprintf("RemoteAlertError{desc=%d}.Error()", tc.desc))
+	}
+}
+
+// TestAlertText_Named checks that every description with a name has one, and
+// that names do not repeat — a duplicate would be a constant typed twice.
+func TestAlertText_Named(t *testing.T) {
+	t.Parallel()
+
+	named := []uint8{
+		record.AlertCloseNotify, record.AlertUnexpectedMessage, record.AlertBadRecordMAC,
+		record.AlertDecryptionFailed, record.AlertRecordOverflow, record.AlertDecompressionFailure,
+		record.AlertHandshakeFailure, record.AlertBadCertificate, record.AlertUnsupportedCertificate,
+		record.AlertCertificateRevoked, record.AlertCertificateExpired, record.AlertCertificateUnknown,
+		record.AlertIllegalParameter, record.AlertUnknownCA, record.AlertAccessDenied,
+		record.AlertDecodeError, record.AlertDecryptError, record.AlertExportRestriction,
+		record.AlertProtocolVersion, record.AlertInsufficientSecurity, record.AlertInternalError,
+		record.AlertInappropriateFallback, record.AlertUserCanceled, record.AlertNoRenegotiation,
+		record.AlertMissingExtension, record.AlertUnsupportedExtension,
+		record.AlertCertificateUnobtainable, record.AlertUnrecognizedName,
+		record.AlertBadCertificateStatusResponse, record.AlertBadCertificateHashValue,
+		record.AlertUnknownPSKIdentity, record.AlertCertificateRequired,
+		record.AlertNoApplicationProtocol, record.AlertECHRequired,
+	}
+
+	seen := make(map[string]uint8, len(named))
+
+	for _, desc := range named {
+		text := record.AlertText(desc)
+		if strings.HasPrefix(text, "alert(") {
+			t.Errorf("AlertText(%d) = %q, want a name", desc, text)
+		}
+
+		if prev, dup := seen[text]; dup {
+			t.Errorf("AlertText(%d) = %q, same as AlertText(%d)", desc, text, prev)
+		}
+
+		seen[text] = desc
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 
 	"github.com/tarantool/go-gostls/internal/ke"
@@ -339,6 +340,14 @@ func (c *ClientState) Handshake() error {
 	recvCT, recvPayload, err := c.layer.ReadRecord()
 	if err != nil {
 		return c.fatal(record.AlertHandshakeFailure, fmt.Errorf("tls: read server CCS: %w", err))
+	}
+
+	// The server's verdict on our flight lands here: a server that rejects
+	// the client Certificate, or anything else it has just read, answers
+	// with an alert instead of its ChangeCipherSpec. Report the alert — that
+	// is the reason the handshake failed, not the record type it came in.
+	if recvCT == record.ContentTypeAlert {
+		return decodeRemoteAlert(recvPayload)
 	}
 
 	if recvCT != record.ContentTypeChangeCipherSpec {
@@ -1206,6 +1215,29 @@ func (c *ClientState) fatal(alertDesc uint8, cause error) error {
 	return cause
 }
 
+// decodeRemoteAlert turns the payload of an alert record the server sent where
+// the handshake expected something else into the error Handshake returns.
+//
+// The error has the shape crypto/tls gives a peer's alert: a *net.OpError with
+// Op "remote error" around the alert, reading "remote error: tls: handshake
+// failure". Code that tells a peer's rejection apart from a local failure by
+// that shape keeps working when it swaps crypto/tls for this package, and the
+// message names what the server objected to.
+func decodeRemoteAlert(payload []byte) error {
+	const alertLen = 2
+
+	if len(payload) < alertLen {
+		return errAlertRecordTruncated
+	}
+
+	level, desc := record.DecodeAlert(payload)
+
+	return &net.OpError{
+		Op:  "remote error",
+		Err: &record.RemoteAlertError{Level: level, Description: desc},
+	}
+}
+
 // writeHandshakeMessage sends one marshaled handshake envelope, splitting it
 // over as many records as it takes.
 //
@@ -1296,15 +1328,7 @@ func (c *ClientState) readHandshakeRecord() (Type, []byte, error) {
 				return 0, nil, errInterleavedHandshake
 			}
 
-			const alertLen = 2
-
-			if len(payload) < alertLen {
-				return 0, nil, errAlertRecordTruncated
-			}
-
-			level, desc := record.DecodeAlert(payload)
-
-			return 0, nil, fmt.Errorf("%w level=%d desc=%d", errAlertReceived, level, desc)
+			return 0, nil, decodeRemoteAlert(payload)
 		default:
 			if len(c.hsBuf) != 0 {
 				return 0, nil, errInterleavedHandshake
