@@ -11,7 +11,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- An alert the server sends during the handshake is reported the way
+  `crypto/tls` reports it: a `*net.OpError` with `Op` `"remote error"` whose
+  text names the alert, e.g. `remote error: tls: handshake failure`. It used
+  to read `tls: received alert level=2 desc=40`.
+
 ### Fixed
+
+- A server that answers the client's second flight with an alert instead of
+  its ChangeCipherSpec — a mutual-TLS server rejecting a missing client
+  certificate, for one — is reported as that alert, not as
+  `tls: expected ChangeCipherSpec, got content type 21`.
 
 ## [v0.1.0] - 2026-08-06
 

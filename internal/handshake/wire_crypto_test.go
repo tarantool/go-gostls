@@ -15,6 +15,7 @@ import (
 	"encoding/asn1"
 	"fmt"
 	"math/big"
+	"net"
 	"testing"
 
 	"github.com/tarantool/go-gostls/internal/record"
@@ -337,7 +338,16 @@ func TestReadHandshakeRecord_AlertReceived(t *testing.T) {
 	c := NewClientState(layer, ClientParams{})
 
 	_, _, err := c.readHandshakeRecord()
-	testutil.ErrIs(t, err, errAlertReceived, "c.readHandshakeRecord")
+
+	// crypto/tls's shape for a peer's alert: a "remote error" *net.OpError
+	// around the alert, which is named rather than numbered.
+	opErr := testutil.ErrAs[*net.OpError](t, err, "c.readHandshakeRecord")
+	testutil.Equal(t, opErr.Op, "remote error", "net.OpError.Op")
+
+	alert := testutil.ErrAs[*record.RemoteAlertError](t, err, "c.readHandshakeRecord")
+	testutil.Equal(t, alert.Level, record.AlertLevelFatal, "alert level")
+	testutil.Equal(t, alert.Description, record.AlertHandshakeFailure, "alert description")
+	testutil.Equal(t, err.Error(), "remote error: tls: handshake failure", "error message")
 }
 
 func TestReadHandshakeRecord_UnexpectedRecordType(t *testing.T) {
