@@ -252,6 +252,14 @@ func (c *ClientState) Handshake() error {
 
 	_ = km
 
+	// The client's second flight — Certificate, ClientKeyExchange,
+	// CertificateVerify, ChangeCipherSpec, Finished — leaves in one write at
+	// Step 10.5. A server that rejects the client Certificate sends its alert
+	// and closes as soon as it has read that first message; written message by
+	// message, the rest of the flight then runs into the closed socket and the
+	// handshake fails with a broken pipe instead of the server's alert.
+	c.layer.BufferWrites()
+
 	// Step 7.5: if the server sent a CertificateRequest, emit client Certificate
 	// (possibly empty). selectClientSigAlg is called once here; sendClientCertificate
 	// uses the same result internally. If a non-empty cert was sent, record the
@@ -327,6 +335,12 @@ func (c *ClientState) Handshake() error {
 	}
 
 	c.transcript.Write(clientFinishedEnv)
+
+	// Step 10.5: send the flight queued since Step 7.5.
+	err = c.layer.Flush()
+	if err != nil {
+		return fmt.Errorf("tls: send client flight: %w", err)
+	}
 
 	// No handshake bytes may straddle the ChangeCipherSpec boundary (RFC 5246
 	// §6.2.1: handshake messages must not be interleaved with other record
@@ -1208,6 +1222,11 @@ func (c *ClientState) expandKeys() (*suites.KeyMaterial, record.Protector, recor
 
 // fatal sends a fatal alert and returns an error wrapping the cause.
 func (c *ClientState) fatal(alertDesc uint8, cause error) error {
+	// Send whatever part of a flight is still queued first: the alert is
+	// sealed with the next sequence number, so the records before it have to
+	// reach the peer too. Then the alert itself goes out unbuffered.
+	_ = c.layer.Flush()
+
 	alertBody := record.EncodeAlert(record.AlertLevelFatal, alertDesc)
 	// Best effort: ignore write error since we're already in an error path.
 	_ = c.layer.WriteRecord(record.ContentTypeAlert, alertBody)
