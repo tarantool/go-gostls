@@ -33,7 +33,10 @@ runs:
       run: |
         git clone --branch "${{ inputs.ref }}" --depth 1 --recurse-submodules \
           https://github.com/gost-engine/engine.git gost-engine
-        cmake -S gost-engine -B gost-engine/build -DCMAKE_BUILD_TYPE=Release
+        # The libprov submodule asks for CMake older than 3.5, which CMake 4
+        # no longer configures without a minimum policy version.
+        cmake -S gost-engine -B gost-engine/build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         cmake --build gost-engine/build --config Release -j"$(nproc)"
         # Installs gost.so into OpenSSL's ENGINESDIR so `-engine gost` resolves it.
         sudo cmake --install gost-engine/build
