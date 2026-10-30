@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   its ChangeCipherSpec — a mutual-TLS server rejecting a missing client
   certificate, for one — is reported as that alert, not as
   `tls: expected ChangeCipherSpec, got content type 21`.
+- The client's second flight — Certificate, ClientKeyExchange,
+  CertificateVerify, ChangeCipherSpec, Finished — is sent in one write, as
+  `crypto/tls` and OpenSSL send it. A server that rejects the client
+  certificate closes the connection as soon as it has read it, and the client
+  used to fail now and then on writing the rest of the flight
+  (`write: broken pipe`) instead of reading the server's alert.
 
 ## [v0.1.0] - 2026-08-06
 

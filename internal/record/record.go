@@ -87,6 +87,11 @@ type Layer struct {
 	recvSeq  uint64
 	sendProt Protector
 	recvProt Protector
+
+	// buffering makes WriteRecord queue sealed records in pending instead of
+	// writing them; Flush sends the queue. Send-side, like sendSeq.
+	buffering bool
+	pending   []byte
 }
 
 // NewLayer returns a Layer using nullProtector for both directions.
@@ -168,6 +173,14 @@ func (l *Layer) WriteRecord(contentType uint8, payload []byte) error {
 	// see TestWriteRecord_OversizedSealedFragmentRejected.
 	binary.BigEndian.PutUint16(hdr[3:5], uint16(len(fragment)))
 
+	if l.buffering {
+		l.pending = append(l.pending, hdr[:]...)
+		l.pending = append(l.pending, fragment...)
+		l.sendSeq++
+
+		return nil
+	}
+
 	_, err = l.rw.Write(hdr[:])
 	if err != nil {
 		return fmt.Errorf("tls record: write header: %w", err)
@@ -179,6 +192,40 @@ func (l *Layer) WriteRecord(contentType uint8, payload []byte) error {
 	}
 
 	l.sendSeq++
+
+	return nil
+}
+
+// BufferWrites makes the following WriteRecord calls queue their records —
+// sealed, sequence-numbered and in order — instead of writing each one, until
+// Flush sends the whole queue in a single Write.
+//
+// It exists for a handshake flight. Written record by record, a flight reaches
+// a peer that may act on its first message and close the connection while the
+// rest is still being written; the client then fails on its own write and never
+// reads the alert that says why. crypto/tls buffers a flight for the same
+// reason, and so does OpenSSL.
+func (l *Layer) BufferWrites() {
+	l.buffering = true
+}
+
+// Flush writes the records queued since BufferWrites in one Write and turns
+// buffering off. It is a no-op when nothing is queued.
+func (l *Layer) Flush() error {
+	l.buffering = false
+
+	if len(l.pending) == 0 {
+		return nil
+	}
+
+	pending := l.pending
+
+	l.pending = nil
+
+	_, err := l.rw.Write(pending)
+	if err != nil {
+		return fmt.Errorf("tls record: write buffered records: %w", err)
+	}
 
 	return nil
 }

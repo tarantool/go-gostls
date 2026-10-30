@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -405,4 +406,100 @@ func TestAlerts_FatalError(t *testing.T) {
 	alert := testutil.ErrAs[*record.AlertError](t, err, "NewFatalAlertError")
 
 	testutil.Equal(t, alert.Description, record.AlertBadRecordMAC, "alert description")
+}
+
+// countingWriter is an io.ReadWriter that counts Write calls.
+type countingWriter struct {
+	bytes.Buffer
+
+	writes int
+}
+
+func (w *countingWriter) Write(b []byte) (int, error) {
+	w.writes++
+
+	return w.Buffer.Write(b)
+}
+
+// TestRecord_BufferWrites_OneWriteOnFlush checks that records written while
+// buffering reach the transport only on Flush, in a single Write, sealed in
+// order with consecutive sequence numbers — the same records an unbuffered
+// layer would have written one by one.
+func TestRecord_BufferWrites_OneWriteOnFlush(t *testing.T) {
+	t.Parallel()
+
+	key := make([]byte, 16)
+	nonce := make([]byte, 4)
+
+	newProt := func() record.Protector {
+		p, err := record.NewAEADProtector(key, nonce)
+		testutil.NoErr(t, err, "NewAEADProtector")
+
+		return p
+	}
+
+	payloads := [][]byte{[]byte("certificate"), []byte("client key exchange"), []byte("finished")}
+
+	unbuffered := new(bytes.Buffer)
+	ul := makeLayer(unbuffered)
+	ul.ChangeCipherSpec(newProt(), nil)
+
+	buffered := new(countingWriter)
+	bl := makeLayer(buffered)
+	bl.ChangeCipherSpec(newProt(), nil)
+	bl.BufferWrites()
+
+	for i, p := range payloads {
+		testutil.NoErr(t, ul.WriteRecord(record.ContentTypeHandshake, p), fmt.Sprintf("unbuffered WriteRecord[%d]", i))
+		testutil.NoErr(t, bl.WriteRecord(record.ContentTypeHandshake, p), fmt.Sprintf("buffered WriteRecord[%d]", i))
+	}
+
+	testutil.Equal(t, buffered.writes, 0, "Writes before Flush")
+
+	testutil.NoErr(t, bl.Flush(), "Flush")
+	testutil.Equal(t, buffered.writes, 1, "Writes after Flush")
+	testutil.EqualBytes(t, buffered.Bytes(), unbuffered.Bytes(), "flushed bytes")
+
+	// Buffering ends with Flush: the next record goes straight out.
+	testutil.NoErr(t, bl.WriteRecord(record.ContentTypeApplicationData, []byte("x")), "WriteRecord after Flush")
+
+	if buffered.writes < 2 {
+		t.Errorf("Writes after an unbuffered WriteRecord: got %d, want at least 2", buffered.writes)
+	}
+}
+
+// TestRecord_Flush_Empty checks that Flush with nothing queued writes nothing.
+func TestRecord_Flush_Empty(t *testing.T) {
+	t.Parallel()
+
+	w := new(countingWriter)
+	l := makeLayer(w)
+
+	testutil.NoErr(t, l.Flush(), "Flush without BufferWrites")
+
+	l.BufferWrites()
+	testutil.NoErr(t, l.Flush(), "Flush with an empty queue")
+	testutil.Equal(t, w.writes, 0, "Writes")
+}
+
+// errTransport is the failure failingRW reports on Write.
+var errTransport = errors.New("transport failed")
+
+// failingRW is an io.ReadWriter whose Write always fails.
+type failingRW struct{ io.Reader }
+
+func (failingRW) Write(_ []byte) (int, error) { return 0, errTransport }
+
+// TestRecord_Flush_WriteError checks that a transport failure on Flush is
+// reported, wrapped.
+func TestRecord_Flush_WriteError(t *testing.T) {
+	t.Parallel()
+
+	l := record.NewLayer(failingRW{})
+	l.BufferWrites()
+
+	testutil.NoErr(t, l.WriteRecord(record.ContentTypeHandshake, []byte("queued")), "WriteRecord while buffering")
+
+	err := l.Flush()
+	testutil.ErrIs(t, err, errTransport, "Flush")
 }

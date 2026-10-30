@@ -740,3 +740,45 @@ func TestSendCertificateVerify_RSA(t *testing.T) {
 	verifyErr := rsa.VerifyPKCS1v15(&rsaKey.PublicKey, cryptoHash, expectedDigest, cvMsg.Signature)
 	testutil.NoErr(t, verifyErr, "signature verification failed")
 }
+
+// TestFatal_FlushesQueuedFlight verifies that a fatal error in the middle of the
+// buffered client flight sends the records queued so far ahead of the alert.
+// The alert is sealed with the next sequence number, so a peer that never saw
+// the records before it could not authenticate it.
+func TestFatal_FlushesQueuedFlight(t *testing.T) {
+	t.Parallel()
+
+	layer, w := makeRecordLayerWithCapture()
+
+	c := &ClientState{
+		params:     ClientParams{Certificates: nil},
+		layer:      layer,
+		transcript: NewTranscript(),
+	}
+
+	layer.BufferWrites()
+
+	_, err := c.sendClientCertificate()
+	testutil.NoErr(t, err, "sendClientCertificate")
+	testutil.Len(t, w.Bytes(), 0, "bytes written while the flight is queued")
+
+	cause := c.fatal(record.AlertInternalError, errKeyExpansionZero)
+	testutil.ErrIs(t, cause, errKeyExpansionZero, "fatal")
+
+	written := w.Bytes()
+
+	var types []uint8
+
+	for len(written) >= 5 {
+		n := 5 + (int(written[3])<<8 | int(written[4]))
+		testutil.MinLen(t, written, n, "record")
+
+		types = append(types, written[0])
+		written = written[n:]
+	}
+
+	testutil.Len(t, written, 0, "trailing bytes")
+	testutil.Len(t, types, 2, "records written")
+	testutil.Equal(t, types[0], record.ContentTypeHandshake, "first record (queued Certificate)")
+	testutil.Equal(t, types[1], record.ContentTypeAlert, "second record (alert)")
+}
