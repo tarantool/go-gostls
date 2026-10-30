@@ -12,7 +12,12 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.25"
+  # Not GO_VERSION from the other workflows: govulncheck has to see the Go
+  # release the code actually ships against, and `@latest` of x/vuln wants
+  # go 1.26. Until 2026-09 this job ran on 1.25 and worked only because its Go
+  # was current; once 1.26.10 shipped, a 1.25 scan reported GO-2026-6809
+  # (fixed in 1.26.10) for a standard library nobody here ships.
+  GO_VERSION: "1.26"
 
 jobs:
   govulncheck:
